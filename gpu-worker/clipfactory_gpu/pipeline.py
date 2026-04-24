@@ -169,14 +169,24 @@ def run_pipeline(
 def _load_sponsor(
     session_id: str, work: Path, r2: R2Client
 ) -> SponsorConfig | None:
-    # V1: if sponsor asset exists at sponsors/{session_id}.mp4 or .png, pull it.
-    for ext in ("mp4", "png", "webp"):
+    # V1: if sponsor asset exists at sponsors/{session_id}.*, pull it.
+    # For video formats we assume a green-screen logo and pre-process with
+    # chroma-key before placing in the output.
+    for ext in ("mp4", "mov", "png", "webp"):
         key = f"sponsors/{session_id}.{ext}"
         head = r2.head(key)
         if head:
             dest = work / f"sponsor.{ext}"
             r2.download(key, dest)
-            return SponsorConfig(path=dest)
+            is_video = ext in {"mp4", "mov"}
+            return SponsorConfig(
+                path=dest,
+                is_video=is_video,
+                remove_green=is_video,
+                chroma_similarity=0.28 if is_video else 0.22,
+                chroma_blend=0.00 if is_video else 0.08,
+                opacity=0.95 if is_video else 0.85,
+            )
     return None
 
 

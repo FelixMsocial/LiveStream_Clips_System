@@ -3,6 +3,7 @@
 9:16 reframe = blurred scaled background + centered scaled foreground.
 Captions are burned in via libass `subtitles=` filter.
 Sponsor overlay (optional) is positioned bottom-right with configurable opacity.
+Video sponsor assets can optionally apply chroma-key pre-processing.
 """
 from __future__ import annotations
 
@@ -21,6 +22,11 @@ class SponsorConfig:
     opacity: float = 0.85
     scale_pct: float = 0.15
     position: str = "bottom-right"
+    is_video: bool = False
+    remove_green: bool = False
+    chroma_color: str = "0x00FF00"
+    chroma_similarity: float = 0.22
+    chroma_blend: float = 0.08
 
 
 def build_cmd(
@@ -66,17 +72,43 @@ def build_cmd(
 
     # Sponsor overlay.
     if sponsor is not None:
-        inputs += ["-i", str(sponsor.path)]
-        sw = int(1080 * sponsor.scale_pct)
-        filter_parts.append(
-            f"[1:v]scale={sw}:-1,format=rgba,colorchannelmixer=aa={sponsor.opacity}[sp]"
-        )
-        pos = {
-            "bottom-right": "W-w-40:H-h-40",
-            "bottom-left": "40:H-h-40",
-            "top-right": "W-w-40:40",
-            "top-left": "40:40",
-        }.get(sponsor.position, "W-w-40:H-h-40")
+        if sponsor.is_video:
+            inputs += ["-stream_loop", "-1", "-i", str(sponsor.path)]
+            filter_parts.append(
+                "[1:v]"
+                "scale=1000:-1,"
+                "format=rgba,"
+                f"chromakey={sponsor.chroma_color}:{sponsor.chroma_similarity}:{sponsor.chroma_blend},"
+                "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(gt(alpha(X,Y)\\,20)\\,255\\,0)',"
+                "eq=saturation=1.06:contrast=1.03:brightness=0.01,"
+                "unsharp=3:3:0.50:3:3:0.00,"
+                f"colorchannelmixer=aa={sponsor.opacity}[sp]"
+            )
+            pos = "(W-w)/2:H-h-8+870-90:shortest=1"
+        else:
+            inputs += ["-i", str(sponsor.path)]
+            sw = int(1080 * sponsor.scale_pct)
+            sponsor_src = "1:v"
+
+            if sponsor.remove_green:
+                prep = ["format=rgba"]
+                prep.append(
+                    "chromakey="
+                    f"{sponsor.chroma_color}:{sponsor.chroma_similarity}:{sponsor.chroma_blend}"
+                )
+                filter_parts.append(f"[1:v]{','.join(prep)}[spbase]")
+                sponsor_src = "spbase"
+
+            filter_parts.append(
+                f"[{sponsor_src}]scale={sw}:-1,format=rgba,colorchannelmixer=aa={sponsor.opacity}[sp]"
+            )
+            pos = {
+                "bottom-right": "W-w-40:H-h-40",
+                "bottom-left": "40:H-h-40",
+                "top-right": "W-w-40:40",
+                "top-left": "40:40",
+            }.get(sponsor.position, "W-w-40:H-h-40")
+
         filter_parts.append(f"[{last}][sp]overlay={pos}[outv]")
         last = "outv"
 
