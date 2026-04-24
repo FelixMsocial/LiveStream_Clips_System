@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ClipFactory review</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0d11; --panel:#151821; --muted:#8a93a6; --fg:#e7ecf3; --ok:#27d07f; --err:#ff6472; --accent:#4f8cff; }
+    body { margin:0; font:14px/1.4 ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+    .wrap { display:grid; grid-template-columns: minmax(280px, 420px) 1fr; gap:20px; padding:24px; max-width:1200px; margin:0 auto; }
+    video { width:100%; border-radius:10px; background:#000; aspect-ratio:9/16; }
+    .panel { background:var(--panel); border-radius:10px; padding:16px; }
+    textarea { width:100%; min-height:90px; background:#0b0d11; color:var(--fg); border:1px solid #2a2f3a; border-radius:8px; padding:10px; font:inherit; }
+    label { display:block; color:var(--muted); font-size:12px; margin:12px 0 6px; text-transform:uppercase; letter-spacing:.05em; }
+    button { padding:10px 18px; border-radius:8px; border:0; cursor:pointer; font-weight:600; margin-right:8px; }
+    .approve { background:var(--ok); color:#042313; }
+    .reject { background:var(--err); color:#2b0308; }
+    .save { background:#2a2f3a; color:var(--fg); }
+    .meta { color:var(--muted); margin-bottom:12px; }
+    .msg { margin-top:12px; padding:10px; border-radius:8px; background:#23262f; }
+    h1 { margin:0 0 4px; font-size:18px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div>
+      <video id="player" controls playsinline></video>
+      <div class="panel" style="margin-top:12px">
+        <h1 id="title">Loading…</h1>
+        <div class="meta" id="meta"></div>
+        <div id="vision" style="font-size:12px; color:var(--muted); white-space:pre-wrap"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <label>Instagram</label>
+      <textarea id="ig"></textarea>
+      <label>YouTube Shorts</label>
+      <textarea id="yt"></textarea>
+      <label>TikTok</label>
+      <textarea id="tt"></textarea>
+      <label>Rejection reason (optional)</label>
+      <input id="reason" style="width:100%;padding:8px;background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:8px;" />
+
+      <div style="margin-top:18px">
+        <button class="save" id="saveBtn">Save edits</button>
+        <button class="approve" id="approveBtn">✅ Approve + post</button>
+        <button class="reject" id="rejectBtn">❌ Reject</button>
+      </div>
+      <div id="msg" class="msg" style="display:none"></div>
+    </div>
+  </div>
+  <script>
+    const DEFAULT_API = "https://clip-approval.missioncontrol5mof.workers.dev";
+    const API = (window.CLIPFACTORY_API ?? DEFAULT_API).replace(/\/$/, "");
+    const params = new URLSearchParams(location.search);
+    const token = params.get("t") ?? "";
+    const clipId = location.pathname.split("/").pop();
+
+    async function load() {
+      const res = await fetch(`${API}/api/clips/${clipId}?t=${encodeURIComponent(token)}`);
+      if (!res.ok) { show("Unauthorized or expired link.", true); return; }
+      const { clip, video_url } = await res.json();
+      document.getElementById("player").src = video_url;
+      document.getElementById("title").textContent = `Clip ${clip.id.slice(0,8)} · ${clip.status}`;
+      document.getElementById("meta").textContent = `@${clip.triggered_by} · ${clip.triggered_at}`;
+      document.getElementById("ig").value = clip.instagram_post_text ?? "";
+      document.getElementById("yt").value = clip.youtube_post_text ?? "";
+      document.getElementById("tt").value = clip.tiktok_post_text ?? "";
+      if (clip.vision_analysis) {
+        try { document.getElementById("vision").textContent = JSON.stringify(JSON.parse(clip.vision_analysis), null, 2); } catch {}
+      }
+    }
+    function edits() {
+      return {
+        instagram: document.getElementById("ig").value,
+        youtube: document.getElementById("yt").value,
+        tiktok: document.getElementById("tt").value,
+      };
+    }
+    async function decide(action) {
+      const body = { action, edits: edits() };
+      if (action === "reject") body.reason = document.getElementById("reason").value || null;
+      const res = await fetch(`${API}/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) show(action === "approve" ? "Approved — dispatching." : "Rejected.");
+      else show("Request failed: " + res.status, true);
+    }
+    async function save() {
+      const res = await fetch(`${API}/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "save", edits: edits() }),
+      });
+      show(res.ok ? "Saved." : "Save failed: " + res.status, !res.ok);
+    }
+    function show(text, isErr) {
+      const el = document.getElementById("msg");
+      el.style.display = "block";
+      el.style.background = isErr ? "#3a1118" : "#113a22";
+      el.textContent = text;
+    }
+    document.getElementById("approveBtn").onclick = () => decide("approve");
+    document.getElementById("rejectBtn").onclick = () => decide("reject");
+    document.getElementById("saveBtn").onclick = save;
+    load();
+  </script>
+</body>
+</html>

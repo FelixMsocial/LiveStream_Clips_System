@@ -1,0 +1,40 @@
+# deps
+node_modules/
+.pnpm-store/
+
+# builds
+dist/
+.svelte-kit/
+build/
+.wrangler/
+.turbo/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# local scratch
+tmp/
+scratch/
+*.mp4
+*.srt
+!packages/shared/assets/**

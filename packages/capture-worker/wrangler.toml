@@ -1,0 +1,28 @@
+name = "clip-capture"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "CLIP_DB"
+database_name = "CLIP_DB"
+database_id = "929a2f7b-71d5-4c28-a524-cce36dea70fa"
+migrations_dir = "../../migrations"
+
+[[r2_buckets]]
+binding = "CLIP_BUCKET"
+bucket_name = "clip-bucket"
+
+[[queues.consumers]]
+queue = "clip-ingest"
+max_batch_size = 5
+max_concurrency = 5
+max_retries = 3
+dead_letter_queue = "clip-ingest-dlq"
+
+[[queues.producers]]
+binding = "CLIP_EDIT"
+queue = "clip-edit"
+
+[vars]
+APPROVAL_WORKER_URL = "https://clip-approval.missioncontrol5mof.workers.dev"

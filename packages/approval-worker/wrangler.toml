@@ -1,0 +1,36 @@
+name = "clip-approval"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "CLIP_DB"
+database_name = "CLIP_DB"
+database_id = "929a2f7b-71d5-4c28-a524-cce36dea70fa"
+migrations_dir = "../../migrations"
+
+[[kv_namespaces]]
+binding = "CLIP_KV"
+id = "3094e6f83d1641749f5141421a89a0b5"
+
+[[r2_buckets]]
+binding = "CLIP_BUCKET"
+bucket_name = "clip-bucket"
+
+[[queues.consumers]]
+queue = "approval-send"
+max_batch_size = 5
+max_concurrency = 5
+max_retries = 3
+dead_letter_queue = "approval-send-dlq"
+
+[[queues.producers]]
+binding = "POST_DISPATCH"
+queue = "post-dispatch"
+
+# Reminder + expiry sweep every minute.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+DASHBOARD_URL = "https://clipfactory.pages.dev"

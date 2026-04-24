@@ -1,0 +1,32 @@
+{
+  "name": "clipfactory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ClipFactory — Livestream Clip System. !clip → IG/YT/TikTok in under 30 minutes.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:listener": "npm run dev --workspace packages/listener-worker",
+    "dev:capture": "npm run dev --workspace packages/capture-worker",
+    "dev:approval": "npm run dev --workspace packages/approval-worker",
+    "dev:post": "npm run dev --workspace packages/post-worker",
+    "dev:dashboard": "npm run dev --workspace apps/dashboard",
+    "deploy:all": "npm run deploy --workspaces --if-present",
+    "d1:migrate:local": "wrangler d1 migrations apply CLIP_DB --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply CLIP_DB --remote",
+    "d1:exec:local": "wrangler d1 execute CLIP_DB --local --file",
+    "d1:exec:remote": "wrangler d1 execute CLIP_DB --remote --file"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.6.3",
+    "wrangler": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

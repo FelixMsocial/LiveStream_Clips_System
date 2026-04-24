@@ -1,0 +1,765 @@
+// Approval Worker:
+//   - Queue consumer on APPROVAL_SEND → builds Telegram message with buttons.
+//   - Telegram webhook → handles callback_query (approve/reject) + text replies.
+//   - Cron → 10m reminder + 20m auto-expire.
+//   - HTTP API (`/api/...`) → used by GPU worker and dashboard.
+//
+// We use one Worker for these because (a) they all share D1/KV/Telegram state and
+// (b) Telegram webhooks are one endpoint anyway.
+
+import {
+  clipsDb,
+  TelegramClient,
+  sendEmail,
+  type ApprovalSendJob,
+  type CaptionsTriple,
+  type ClipRow,
+  type PostDispatchJob,
+} from "@clipfactory/shared";
+import type { Env } from "./env.js";
+import { signJwt, verifyJwt } from "./jwt.js";
+
+const TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
+const VIDEO_ATTACH_MAX_BYTES = 49 * 1024 * 1024; // Telegram limit via bot API
+const PAGES_PROD_ORIGIN = "https://clipfactory.pages.dev";
+
+export default {
+  async queue(batch: MessageBatch<ApprovalSendJob>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      try {
+        await sendApprovalRequest(msg.body.clip_id, env);
+        msg.ack();
+      } catch (err) {
+        console.error("approval send error", msg.body.clip_id, err);
+        await clipsDb.appendErrorLog(
+          env.CLIP_DB,
+          msg.body.clip_id,
+          "approval_send",
+          String(err),
+        );
+        msg.retry({ delaySeconds: 15 });
+      }
+    }
+  },
+
+  async scheduled(_ev: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(sweepPending(env));
+    ctx.waitUntil(checkHeartbeats(env));
+  },
+
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(req.url);
+
+    if (req.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
+      return new Response(null, {
+        status: 204,
+        headers: buildCorsHeaders(req.headers.get("origin")),
+      });
+    }
+
+    if (url.pathname === "/healthz") return Response.json({ ok: true });
+
+    // Telegram webhook.
+    if (url.pathname === "/telegram/webhook" && req.method === "POST") {
+      const supplied = req.headers.get(TELEGRAM_SECRET_HEADER);
+      if (env.TELEGRAM_WEBHOOK_SECRET && supplied !== env.TELEGRAM_WEBHOOK_SECRET) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const update = await req.json<TelegramUpdate>();
+      ctx.waitUntil(handleTelegramUpdate(update, env));
+      return new Response("ok");
+    }
+
+    // n8n callback: { clip_id, post_urls: {...} }
+    if (url.pathname === "/webhook/clip-posted" && req.method === "POST") {
+      // Simple shared-secret gate.
+      const auth = req.headers.get("authorization") ?? "";
+      if (!auth || auth !== `Bearer ${env.GPU_INTERNAL_SECRET}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const body = await req.json<{ clip_id: string; post_urls: Record<string, string> }>();
+      await clipsDb.setStatus(env.CLIP_DB, body.clip_id, "posted", {
+        post_urls: JSON.stringify(body.post_urls ?? {}),
+        posted_at: new Date().toISOString(),
+      });
+      await clipsDb.appendApprovalLog(env.CLIP_DB, body.clip_id, "posted", "n8n", {
+        post_urls: body.post_urls,
+      });
+      return Response.json({ ok: true });
+    }
+
+    // Internal APIs (GPU worker, dashboard).
+    if (url.pathname.startsWith("/api/")) {
+      const res = await handleApi(req, url, env);
+      return withCors(req, res);
+    }
+
+    return new Response("clip-approval", { status: 200 });
+  },
+};
+
+// -------------------- Telegram + email fallback -------------------- //
+
+/**
+ * Send a Telegram message; on failure, fall back to email via Resend.
+ * Returns `{ ok, channel }` where channel is "telegram" | "email" | "none".
+ */
+async function sendTelegramWithFallback(
+  tg: TelegramClient,
+  tgCall: () => Promise<unknown>,
+  env: Env,
+  emailSubject: string,
+  emailHtml: string,
+): Promise<{ ok: boolean; channel: "telegram" | "email" | "none" }> {
+  try {
+    await tgCall();
+    return { ok: true, channel: "telegram" };
+  } catch (tgErr) {
+    console.error("telegram send failed, attempting email fallback:", tgErr);
+    if (env.RESEND_API_KEY && env.ALERT_EMAIL_TO) {
+      const result = await sendEmail(env.RESEND_API_KEY, env.ALERT_EMAIL_TO, emailSubject, emailHtml);
+      if (result.ok) {
+        return { ok: true, channel: "email" };
+      }
+      console.error("email fallback also failed:", result.error);
+    }
+    return { ok: false, channel: "none" };
+  }
+}
+
+// -------------------- APPROVAL_SEND → Telegram -------------------- //
+
+async function sendApprovalRequest(clipId: string, env: Env): Promise<void> {
+  const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+  if (!clip) throw new Error(`clip ${clipId} not found`);
+  if (!clip.final_clip_r2_key) throw new Error(`clip ${clipId} has no final_clip_r2_key`);
+
+  const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const token = await signJwt(
+    env.DASHBOARD_JWT_SECRET,
+    { clip_id: clipId, purpose: "review" },
+    1800,
+  );
+  const reviewUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review/${clipId}?t=${token}`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: "✅ Approve", callback_data: `approve:${clipId}` },
+        { text: "❌ Reject", callback_data: `reject:${clipId}` },
+      ],
+      [{ text: "✏️ Edit on dashboard", url: reviewUrl }],
+    ],
+  };
+
+  const caption = buildTelegramCaption(clip);
+  let messageId: number | undefined;
+  const obj = await env.CLIP_BUCKET.head(clip.final_clip_r2_key);
+  const size = obj?.size ?? 0;
+  const videoUrl = await buildFinalClipUrl(env, clip.final_clip_r2_key);
+
+  const emailSubject = `ClipFactory — clip ${clipId} pending approval`;
+  const emailHtml = `<p>${caption.replace(/\n/g, "<br>")}</p><p><a href="${videoUrl}">Watch clip</a></p><p><a href="${reviewUrl}">Review on dashboard</a></p>`;
+
+  if (size > 0 && size <= VIDEO_ATTACH_MAX_BYTES) {
+    const result = await sendTelegramWithFallback(
+      tg,
+      async () => {
+        const res = await tg.sendVideo({
+          chat_id: env.TELEGRAM_APPROVER_CHAT_ID,
+          video: videoUrl,
+          caption,
+          parse_mode: "HTML",
+          reply_markup: keyboard,
+          supports_streaming: true,
+        });
+        messageId = res.message_id;
+      },
+      env,
+      emailSubject,
+      emailHtml,
+    );
+    if (!result.ok) throw new Error("approval send failed via all channels");
+  } else {
+    const result = await sendTelegramWithFallback(
+      tg,
+      async () => {
+        const res = await tg.sendMessage({
+          chat_id: env.TELEGRAM_APPROVER_CHAT_ID,
+          text: `${caption}\n\n<a href="${videoUrl}">Watch clip</a>`,
+          parse_mode: "HTML",
+          reply_markup: keyboard,
+        });
+        messageId = res.message_id;
+      },
+      env,
+      emailSubject,
+      emailHtml,
+    );
+    if (!result.ok) throw new Error("approval send failed via all channels");
+  }
+
+  await clipsDb.setStatus(env.CLIP_DB, clipId, "pending_approval", {
+    telegram_message_id: messageId ?? null,
+    sent_at: new Date().toISOString(),
+  });
+  await clipsDb.appendApprovalLog(env.CLIP_DB, clipId, "sent", "approval-worker", {
+    message_id: messageId ?? null,
+  });
+}
+
+function buildTelegramCaption(clip: ClipRow): string {
+  const vibe = safeVibe(clip.vision_analysis);
+  const lines = [
+    `<b>ClipFactory</b> — pending approval`,
+    `• vibe: ${vibe}`,
+    `• triggered by: @${clip.triggered_by}`,
+    clip.label ? `• label: ${clip.label}` : "",
+    "",
+    `<b>IG:</b> ${trunc(clip.instagram_post_text, 180)}`,
+    `<b>YT:</b> ${trunc(clip.youtube_post_text, 180)}`,
+    `<b>TT:</b> ${trunc(clip.tiktok_post_text, 180)}`,
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function safeVibe(visionJson: string | null): string {
+  if (!visionJson) return "unknown";
+  try {
+    const v = JSON.parse(visionJson) as { vibe?: string };
+    return v.vibe ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function trunc(s: string | null, n: number): string {
+  if (!s) return "—";
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+async function buildFinalClipUrl(env: Env, key: string): Promise<string> {
+  // Prefer a public R2 base if configured. Otherwise use a presigned URL.
+  if (env.R2_PUBLIC_BASE) {
+    return `${env.R2_PUBLIC_BASE.replace(/\/$/, "")}/${key}`;
+  }
+  if (
+    env.R2_ACCOUNT_ID &&
+    env.R2_ACCESS_KEY_ID &&
+    env.R2_SECRET_ACCESS_KEY &&
+    env.R2_BUCKET_NAME
+  ) {
+    const { signR2GetUrl } = await import("@clipfactory/shared/r2");
+    return signR2GetUrl(
+      {
+        accountId: env.R2_ACCOUNT_ID,
+        accessKeyId: env.R2_ACCESS_KEY_ID,
+        secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+        bucket: env.R2_BUCKET_NAME,
+      },
+      key,
+      3600,
+    );
+  }
+  throw new Error("no R2 public base or S3-compat credentials configured");
+}
+
+// -------------------- Telegram inbound -------------------- //
+
+interface TelegramUpdate {
+  callback_query?: {
+    id: string;
+    from: { id: number; username?: string };
+    message: { message_id: number; chat: { id: number } };
+    data: string;
+  };
+  message?: {
+    message_id: number;
+    chat: { id: number };
+    from: { id: number; username?: string };
+    reply_to_message?: { message_id: number };
+    text?: string;
+  };
+}
+
+async function handleTelegramUpdate(update: TelegramUpdate, env: Env): Promise<void> {
+  const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const userId = String(cq.from.id);
+    if (!(await clipsDb.isApprover(env.CLIP_DB, userId))) {
+      await tg.answerCallbackQuery({
+        callback_query_id: cq.id,
+        text: "Not authorized.",
+        show_alert: true,
+      });
+      return;
+    }
+    const [action, clipId] = cq.data.split(":");
+    if (!action || !clipId) {
+      await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Bad payload" });
+      return;
+    }
+
+    if (action === "approve") {
+      await approveClip(clipId, userId, env, tg, cq.message.chat.id, cq.message.message_id);
+      await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Approved." });
+    } else if (action === "reject") {
+      await rejectClip(clipId, userId, null, env, tg, cq.message.chat.id, cq.message.message_id);
+      await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Rejected." });
+    } else {
+      await tg.answerCallbackQuery({
+        callback_query_id: cq.id,
+        text: `Unknown action: ${action}`,
+      });
+    }
+  }
+}
+
+// -------------------- approve / reject -------------------- //
+
+async function approveClip(
+  clipId: string,
+  actor: string,
+  env: Env,
+  tg: TelegramClient,
+  chatId: number,
+  messageId: number,
+): Promise<void> {
+  const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+  if (!clip || clip.status !== "pending_approval") return;
+  await clipsDb.setStatus(env.CLIP_DB, clipId, "approved", {
+    approver_decision: "approved",
+    approved_at: new Date().toISOString(),
+  });
+  await clipsDb.appendApprovalLog(env.CLIP_DB, clipId, "approved", actor, null);
+  const job: PostDispatchJob = { clip_id: clipId, approved_by: actor };
+  await env.POST_DISPATCH.send(job);
+  await tg
+    .editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: undefined })
+    .catch(() => {});
+}
+
+async function rejectClip(
+  clipId: string,
+  actor: string,
+  reason: string | null,
+  env: Env,
+  tg: TelegramClient,
+  chatId: number,
+  messageId: number,
+): Promise<void> {
+  const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+  if (!clip || clip.status !== "pending_approval") return;
+  await clipsDb.setStatus(env.CLIP_DB, clipId, "rejected", {
+    approver_decision: "rejected",
+    approver_reason: reason,
+  });
+  await clipsDb.appendApprovalLog(env.CLIP_DB, clipId, "rejected", actor, { reason });
+  await tg
+    .editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: undefined })
+    .catch(() => {});
+}
+
+// -------------------- Cron: reminders + expiry -------------------- //
+
+async function sweepPending(env: Env): Promise<void> {
+  const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+
+  // Reminders: pending > 10m, reminder not yet sent.
+  // Plain sent_at comparison (no datetime() wrapper) allows idx_clips_pending_sent index to be used.
+  const reminders = await env.CLIP_DB.prepare(
+    `SELECT id, sent_at FROM clips
+     WHERE status = 'pending_approval'
+       AND reminder_sent = 0
+       AND sent_at IS NOT NULL
+       AND sent_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-10 minutes')`,
+  ).all<{ id: string; sent_at: string }>();
+  // Send Telegram notifications first, then batch all D1 writes together
+  const reminderSuccessIds: Array<{ id: string; channel: string }> = [];
+  for (const r of reminders.results ?? []) {
+    try {
+      const reminderText = `⏰ Reminder: clip ${r.id} awaiting approval. Auto-expires in 10 min.`;
+      const result = await sendTelegramWithFallback(
+        tg,
+        () => tg.sendMessage({ chat_id: env.TELEGRAM_APPROVER_CHAT_ID, text: reminderText }),
+        env,
+        `ClipFactory reminder — clip ${r.id}`,
+        `<p>${reminderText}</p>`,
+      );
+      if (result.ok) {
+        reminderSuccessIds.push({ id: r.id, channel: result.channel });
+      } else {
+        console.error("reminder delivery failed via all channels for clip", r.id);
+      }
+    } catch (e) {
+      console.error("reminder send failed", r.id, e);
+    }
+  }
+  // Batch all reminder D1 writes in a single round-trip
+  if (reminderSuccessIds.length > 0) {
+    const stmts: D1PreparedStatement[] = [];
+    for (const { id, channel } of reminderSuccessIds) {
+      stmts.push(
+        env.CLIP_DB.prepare(
+          `UPDATE clips SET reminder_sent = 1, updated_at = datetime('now') WHERE id = ?1`,
+        ).bind(id),
+      );
+      stmts.push(
+        env.CLIP_DB.prepare(
+          `INSERT INTO approval_log (clip_id, action, actor, detail, ts) VALUES (?1, 'reminder', 'cron', ?2, datetime('now'))`,
+        ).bind(id, JSON.stringify({ channel })),
+      );
+    }
+    await env.CLIP_DB.batch(stmts);
+  }
+
+  // Expiries: pending > 20m.
+  // Plain sent_at comparison allows idx_clips_pending_sent index to be used.
+  const expired = await env.CLIP_DB.prepare(
+    `SELECT id FROM clips
+     WHERE status = 'pending_approval'
+       AND sent_at IS NOT NULL
+       AND sent_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes')`,
+  ).all<{ id: string }>();
+  // Batch all expiry D1 writes, then send notifications
+  if ((expired.results ?? []).length > 0) {
+    const expiryStmts: D1PreparedStatement[] = [];
+    for (const r of expired.results ?? []) {
+      expiryStmts.push(
+        env.CLIP_DB.prepare(
+          `UPDATE clips SET status = 'expired', updated_at = datetime('now') WHERE id = ?1`,
+        ).bind(r.id),
+      );
+      expiryStmts.push(
+        env.CLIP_DB.prepare(
+          `INSERT INTO approval_log (clip_id, action, actor, detail, ts) VALUES (?1, 'expired', 'cron', NULL, datetime('now'))`,
+        ).bind(r.id),
+      );
+    }
+    await env.CLIP_DB.batch(expiryStmts);
+  }
+  // Send expiry notifications after DB writes (non-critical, best-effort)
+  for (const r of expired.results ?? []) {
+    try {
+      const expireText = `⚠️ Clip ${r.id} expired with no approver decision.`;
+      await sendTelegramWithFallback(
+        tg,
+        () => tg.sendMessage({ chat_id: env.TELEGRAM_JORDY_CHAT_ID, text: expireText }),
+        env,
+        `ClipFactory — clip ${r.id} expired`,
+        `<p>${expireText}</p>`,
+      );
+    } catch (e) {
+      console.error("expire escalate failed", r.id, e);
+    }
+  }
+}
+
+// -------------------- Heartbeat dead-man checks -------------------- //
+
+async function checkHeartbeats(env: Env): Promise<void> {
+  const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const checks = [
+    { kvKey: "gpu:heartbeat", alertKey: "alert:gpu:sent", label: "GPU worker" },
+    { kvKey: "gpu:heartbeat:listener", alertKey: "alert:listener:sent", label: "Twitch listener" },
+  ];
+  for (const { kvKey, alertKey, label } of checks) {
+    const val = await env.CLIP_KV.get(kvKey);
+    if (val !== null) {
+      // Heartbeat is alive — clear any sent-alert flag so we can alert again if it dies later.
+      const alertWasSent = await env.CLIP_KV.get(alertKey);
+      if (alertWasSent) await env.CLIP_KV.delete(alertKey);
+      continue;
+    }
+    // Heartbeat missing (TTL expired = dead for 5+ min). Check if we already alerted recently.
+    const alreadySent = await env.CLIP_KV.get(alertKey);
+    if (alreadySent) continue; // Suppress duplicate alerts for 30 minutes.
+    const alertText = `🔴 ${label} has been unresponsive for 5+ minutes.`;
+    try {
+      const result = await sendTelegramWithFallback(
+        tg,
+        () => tg.sendMessage({ chat_id: env.TELEGRAM_JORDY_CHAT_ID, text: alertText }),
+        env,
+        `ClipFactory — ${label} unresponsive`,
+        `<p>${alertText}</p>`,
+      );
+      if (result.ok) {
+        await env.CLIP_KV.put(alertKey, String(Date.now()), { expirationTtl: 1800 }); // 30 min suppression
+      } else {
+        console.error(`heartbeat alert delivery failed for ${label} via all channels`);
+      }
+    } catch (e) {
+      console.error(`heartbeat alert failed for ${label}`, e);
+    }
+  }
+}
+
+// -------------------- HTTP API -------------------- //
+
+async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
+  // GPU worker heartbeat.
+  if (url.pathname === "/api/gpu/heartbeat" && req.method === "POST") {
+    if (!checkInternal(req, env)) return forbidden();
+    const body = await req
+      .json<{ worker_id?: string }>()
+      .catch(() => ({}) as { worker_id?: string });
+    await env.CLIP_KV.put(
+      "gpu:heartbeat",
+      JSON.stringify({ at: Date.now(), worker_id: body.worker_id ?? "unknown" }),
+      { expirationTtl: 300 },
+    );
+    return Response.json({ ok: true });
+  }
+
+  // Internal alert endpoint — called by capture-worker (and others) to send alerts.
+  if (url.pathname === "/api/internal/alert" && req.method === "POST") {
+    if (!checkInternal(req, env)) return forbidden();
+    const body = await req.json<{ clip_id?: string; alert_type: string; message: string }>();
+
+    // Dedup: if clip_id is provided, suppress duplicate alerts for the same clip+type (5 min).
+    if (body.clip_id) {
+      const dedupKey = `alert:dedup:${body.clip_id}:${body.alert_type}`;
+      const existing = await env.CLIP_KV.get(dedupKey);
+      if (existing) {
+        return Response.json({ ok: true, channel: "dedup", deduplicated: true });
+      }
+      await env.CLIP_KV.put(dedupKey, String(Date.now()), { expirationTtl: 300 }); // 5 min
+    }
+
+    const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const alertText = `🚨 ${body.alert_type}: ${body.message}`;
+    const result = await sendTelegramWithFallback(
+      tg,
+      () => tg.sendMessage({ chat_id: env.TELEGRAM_JORDY_CHAT_ID, text: alertText }),
+      env,
+      `ClipFactory alert — ${body.alert_type}`,
+      `<p><strong>${body.alert_type}</strong></p><p>${body.message.replace(/\n/g, "<br>")}</p>`,
+    );
+    if (body.clip_id) {
+      await clipsDb.appendApprovalLog(env.CLIP_DB, body.clip_id, "alert", "system", {
+        alert_type: body.alert_type,
+        channel: result.channel,
+      });
+    }
+    return Response.json({ ok: result.ok, channel: result.channel });
+  }
+
+  // GPU worker → fetch latest prompts from D1.
+  if (url.pathname === "/api/internal/prompts" && req.method === "GET") {
+    if (!checkInternal(req, env)) return forbidden();
+    const rows = await env.CLIP_DB.prepare(
+      `SELECT p.key, p.body FROM prompts p
+       INNER JOIN (SELECT key, MAX(version) AS max_v FROM prompts GROUP BY key) latest
+       ON p.key = latest.key AND p.version = latest.max_v`,
+    ).all<{ key: string; body: string }>();
+    const prompts: Record<string, string> = {};
+    for (const r of rows.results ?? []) prompts[r.key] = r.body;
+    return Response.json({ prompts });
+  }
+
+  // GPU worker → patch clip row.
+  const patchMatch = /^\/api\/internal\/clips\/([^/]+)$/.exec(url.pathname);
+  if (patchMatch && req.method === "PATCH") {
+    if (!checkInternal(req, env)) return forbidden();
+    const clipId = patchMatch[1]!;
+    const patch = await req.json<Partial<Record<string, string | number | null>>>();
+    const allowed = new Set([
+      "status",
+      "vision_analysis",
+      "transcript_srt",
+      "final_clip_r2_key",
+      "instagram_post_text",
+      "youtube_post_text",
+      "tiktok_post_text",
+      "gpu_timings_ms",
+      "duration_sec",
+    ]);
+    const entries = Object.entries(patch).filter(([k]) => allowed.has(k));
+    if (entries.length === 0) return Response.json({ ok: true });
+    const fields = entries.map(([k], i) => `${k} = ?${i + 1}`);
+    fields.push(`updated_at = datetime('now')`);
+    const bindings = entries.map(([, v]) => v as string | number | null);
+    bindings.push(clipId);
+    await env.CLIP_DB.prepare(
+      `UPDATE clips SET ${fields.join(", ")} WHERE id = ?${bindings.length}`,
+    )
+      .bind(...bindings)
+      .run();
+    return Response.json({ ok: true });
+  }
+
+  // GPU worker → enqueue APPROVAL_SEND (triggered when pipeline finishes).
+  if (url.pathname === "/api/internal/approval-send" && req.method === "POST") {
+    if (!checkInternal(req, env)) return forbidden();
+    const body = await req.json<{ clip_id: string }>();
+    // We'd normally enqueue through a Queue binding, but approval-worker is the
+    // consumer and cannot enqueue to itself. Instead, send the Telegram message directly.
+    await sendApprovalRequest(body.clip_id, env);
+    return Response.json({ ok: true });
+  }
+
+  // Dashboard: GET /api/clips/:id (token-validated)
+  const clipMatch = /^\/api\/clips\/([^/]+)$/.exec(url.pathname);
+  if (clipMatch && req.method === "GET") {
+    const clipId = clipMatch[1]!;
+    const token = url.searchParams.get("t") ?? "";
+    const ok = await verifyJwt<{ clip_id: string }>(env.DASHBOARD_JWT_SECRET, token);
+    if (!ok || ok.clip_id !== clipId) return forbidden();
+    const row = await clipsDb.getClip(env.CLIP_DB, clipId);
+    if (!row) return new Response("not found", { status: 404 });
+    const videoUrl = row.final_clip_r2_key
+      ? await buildFinalClipUrl(env, row.final_clip_r2_key)
+      : null;
+    return Response.json({ clip: row, video_url: videoUrl });
+  }
+
+  // Dashboard: POST /api/clips/:id/decision  { action, reason?, edits? }
+  const decisionMatch = /^\/api\/clips\/([^/]+)\/decision$/.exec(url.pathname);
+  if (decisionMatch && req.method === "POST") {
+    const clipId = decisionMatch[1]!;
+    const token = url.searchParams.get("t") ?? "";
+    const ok = await verifyJwt<{ clip_id: string }>(env.DASHBOARD_JWT_SECRET, token);
+    if (!ok || ok.clip_id !== clipId) return forbidden();
+    const body = await req.json<{
+      action: "approve" | "reject" | "save";
+      reason?: string;
+      edits?: Partial<CaptionsTriple>;
+    }>();
+    const actor = "dashboard";
+    const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+    if (!clip) return new Response("not found", { status: 404 });
+
+    if (body.edits) {
+      const patch: Record<string, string | null> = {};
+      if (typeof body.edits.instagram === "string") patch.instagram_post_text = body.edits.instagram;
+      if (typeof body.edits.youtube === "string") patch.youtube_post_text = body.edits.youtube;
+      if (typeof body.edits.tiktok === "string") patch.tiktok_post_text = body.edits.tiktok;
+      patch.approver_edits = JSON.stringify(body.edits);
+      await clipsDb.updateClip(env.CLIP_DB, clipId, patch);
+      await clipsDb.appendApprovalLog(env.CLIP_DB, clipId, "edited", actor, body.edits);
+    }
+
+    const chatId = Number(env.TELEGRAM_APPROVER_CHAT_ID);
+    const msgId = clip.telegram_message_id ?? 0;
+
+    if (body.action === "approve") {
+      await approveClip(clipId, actor, env, tg, chatId, msgId);
+    } else if (body.action === "reject") {
+      await rejectClip(clipId, actor, body.reason ?? null, env, tg, chatId, msgId);
+    } // else "save" — edits were already applied above.
+    return Response.json({ ok: true });
+  }
+
+  // Dashboard token: POST /api/dashboard/token { secret } → { token }
+  if (url.pathname === "/api/dashboard/token" && req.method === "POST") {
+    const body = await req.json<{ secret: string }>().catch(() => ({ secret: "" }));
+    const expectedSecret = env.DASHBOARD_ADMIN_SECRET ?? env.GPU_INTERNAL_SECRET;
+    if (!body.secret || body.secret !== expectedSecret) return forbidden();
+    const token = await signJwt(env.DASHBOARD_JWT_SECRET, { purpose: "dashboard" }, 86400); // 24h
+    return Response.json({ token });
+  }
+
+  // Dashboard: GET /api/dashboard (JWT-protected via ?t= query param)
+  if (url.pathname === "/api/dashboard" && req.method === "GET") {
+    const token = url.searchParams.get("t") ?? "";
+    const payload = await verifyJwt<{ purpose: string }>(env.DASHBOARD_JWT_SECRET, token);
+    if (!payload || payload.purpose !== "dashboard") return forbidden();
+    // Use db.batch() for a single D1 round-trip instead of Promise.all (avoids timeout)
+    const batchResults = await env.CLIP_DB.batch([
+      env.CLIP_DB.prepare(
+        `SELECT id, status, triggered_by, triggered_at, posted_at, post_urls
+         FROM clips ORDER BY triggered_at DESC LIMIT 50`,
+      ),
+      // Range comparison allows idx_clips_triggered_at to be used (no function wrapping)
+      env.CLIP_DB.prepare(
+        `SELECT COUNT(*) as today_count FROM clips
+         WHERE triggered_at >= strftime('%Y-%m-%dT00:00:00', 'now')
+           AND triggered_at < strftime('%Y-%m-%dT00:00:00', 'now', '+1 day')`,
+      ),
+      env.CLIP_DB.prepare(
+        `SELECT COUNT(*) as active_count FROM clips WHERE status IN ('raw','downloaded','analyzing','editing','pending_approval','approved','ready_to_post')`,
+      ),
+      // Merged: status breakdown + outcome counts in a single full-table pass
+      env.CLIP_DB.prepare(
+        `SELECT status, COUNT(*) as count FROM clips GROUP BY status`,
+      ),
+      env.CLIP_DB.prepare(
+        `SELECT AVG((julianday(posted_at) - julianday(triggered_at)) * 24 * 60) as avg_minutes_to_post FROM clips WHERE status = 'posted' AND posted_at IS NOT NULL`,
+      ),
+    ]);
+    const rows = batchResults[0] as D1Result;
+    const todayCount = (batchResults[1] as D1Result).results?.[0] as { today_count: number } | undefined;
+    const activeCount = (batchResults[2] as D1Result).results?.[0] as { active_count: number } | undefined;
+    const statusRows = (batchResults[3] as D1Result<{ status: string; count: number }>).results ?? [];
+    const avgTime = (batchResults[4] as D1Result).results?.[0] as { avg_minutes_to_post: number | null } | undefined;
+    // Derive outcome counts from status breakdown instead of a separate full-table scan
+    const breakdown: Record<string, number> = {};
+    for (const r of statusRows) breakdown[r.status] = r.count;
+    const failedStatuses = ["failed_capture", "failed_edit", "failed_post"];
+    const outcomes = {
+      success: breakdown["posted"] ?? 0,
+      failed: failedStatuses.reduce((sum, s) => sum + (breakdown[s] ?? 0), 0),
+      rejected: breakdown["rejected"] ?? 0,
+      expired: breakdown["expired"] ?? 0,
+    };
+    return Response.json({
+      clips: rows.results ?? [],
+      stats: {
+        today_count: todayCount?.today_count ?? 0,
+        active_count: activeCount?.active_count ?? 0,
+        avg_minutes_to_post: avgTime?.avg_minutes_to_post ?? null,
+        status_breakdown: breakdown,
+        success: outcomes.success,
+        failed: outcomes.failed,
+        rejected: outcomes.rejected,
+        expired: outcomes.expired,
+      },
+    });
+  }
+
+  return new Response("not found", { status: 404 });
+}
+
+function checkInternal(req: Request, env: Env): boolean {
+  const auth = req.headers.get("authorization") ?? "";
+  return !!env.GPU_INTERNAL_SECRET && auth === `Bearer ${env.GPU_INTERNAL_SECRET}`;
+}
+
+function forbidden(): Response {
+  return new Response("forbidden", { status: 403 });
+}
+
+function withCors(req: Request, res: Response): Response {
+  const cors = buildCorsHeaders(req.headers.get("origin"));
+  let hasCors = false;
+  for (const _ of cors.entries()) {
+    hasCors = true;
+    break;
+  }
+  if (!hasCors) return res;
+
+  const headers = new Headers(res.headers);
+  for (const [k, v] of cors.entries()) headers.set(k, v);
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
+}
+
+function buildCorsHeaders(origin: string | null): Headers {
+  const h = new Headers();
+  if (!origin) return h;
+
+  if (origin === PAGES_PROD_ORIGIN || origin.endsWith(".clipfactory.pages.dev")) {
+    h.set("access-control-allow-origin", origin);
+    h.set("access-control-allow-methods", "GET,POST,PATCH,OPTIONS");
+    h.set("access-control-allow-headers", "authorization,content-type");
+    h.set("access-control-max-age", "86400");
+    h.set("vary", "origin");
+  }
+  return h;
+}

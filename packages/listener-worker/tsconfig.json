@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "paths": {
+      "@clipfactory/shared": ["../shared/src/index.ts"],
+      "@clipfactory/shared/*": ["../shared/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

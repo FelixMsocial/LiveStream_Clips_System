@@ -1,0 +1,14 @@
+{
+  "name": "@clipfactory/dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev ./public --compatibility-date=2025-04-01",
+    "deploy": "wrangler pages deploy ./public --project-name=clipfactory",
+    "build": "echo static"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

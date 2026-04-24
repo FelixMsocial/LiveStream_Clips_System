@@ -1,0 +1,36 @@
+name = "clip-listener"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Durable Object holds the long-lived Twitch IRC WebSocket.
+[[durable_objects.bindings]]
+name = "CHAT_LISTENER"
+class_name = "ChatListenerDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatListenerDO"]
+
+[[d1_databases]]
+binding = "CLIP_DB"
+database_name = "CLIP_DB"
+database_id = "929a2f7b-71d5-4c28-a524-cce36dea70fa"
+migrations_dir = "../../migrations"
+
+[[kv_namespaces]]
+binding = "CLIP_KV"
+id = "3094e6f83d1641749f5141421a89a0b5"
+
+[[queues.producers]]
+binding = "CLIP_INGEST"
+queue = "clip-ingest"
+
+# Heartbeat cron — checks the DO is alive and restarts it if not.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+# Lower-case broadcaster login; e.g. "jordy". Override per env via wrangler secret/vars.
+TWITCH_BROADCASTER_LOGIN = "felix_msocial"
+TWITCH_BOT_NICK = "felix_msocial"
