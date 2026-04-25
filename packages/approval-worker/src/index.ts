@@ -711,13 +711,42 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     return Response.json({ ok: true });
   }
 
-  // Dashboard token: POST /api/dashboard/token { secret } → { token }
-  if (url.pathname === "/api/dashboard/token" && req.method === "POST") {
-    const body = await req.json<{ secret: string }>().catch(() => ({ secret: "" }));
-    const expectedSecret = env.DASHBOARD_ADMIN_SECRET ?? env.GPU_INTERNAL_SECRET;
-    if (!body.secret || body.secret !== expectedSecret) return forbidden();
+  // Dashboard login: POST /api/auth/login { username, password } → { token }
+  if (url.pathname === "/api/auth/login" && req.method === "POST") {
+    const body = await req.json<{ username?: string; password?: string }>().catch(() => ({}));
+    const username = (body.username ?? "").trim().toLowerCase();
+    const password = body.password ?? "";
+    if (!username || !password) return new Response("missing credentials", { status: 401 });
+    const row = await env.CLIP_DB.prepare(
+      `SELECT salt, password_hash FROM dashboard_users WHERE username = ?1`,
+    ).bind(username).first<{ salt: string; password_hash: string }>();
+    // Always run hash derivation to avoid timing oracle even when user not found.
+    const salt = row?.salt ?? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=";
+    const derived = await hashPbkdf2(password, salt);
+    if (!row || !timingSafeEqual(derived, row.password_hash)) {
+      return new Response("invalid credentials", { status: 401 });
+    }
     const token = await signJwt(env.DASHBOARD_JWT_SECRET, { purpose: "dashboard" }, 86400); // 24h
     return Response.json({ token });
+  }
+
+  // Internal: POST /api/internal/setup-dashboard-user { username, password } — create/reset a user
+  if (url.pathname === "/api/internal/setup-dashboard-user" && req.method === "POST") {
+    if (!checkInternal(req, env)) return forbidden();
+    const body = await req.json<{ username?: string; password?: string }>().catch(() => ({}));
+    const username = (body.username ?? "").trim().toLowerCase();
+    const password = body.password ?? "";
+    if (!username || password.length < 8) {
+      return new Response("username required and password must be at least 8 characters", { status: 400 });
+    }
+    const salt = randomSalt();
+    const hash = await hashPbkdf2(password, salt);
+    await env.CLIP_DB.prepare(
+      `INSERT INTO dashboard_users (username, salt, password_hash)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(username) DO UPDATE SET salt = excluded.salt, password_hash = excluded.password_hash`,
+    ).bind(username, salt, hash).run();
+    return Response.json({ ok: true, username });
   }
 
   // Dashboard: GET /api/dashboard (JWT-protected via ?t= query param)
@@ -869,4 +898,33 @@ function safeOrigin(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+// -------------------- Password helpers (PBKDF2 via Web Crypto) -------------------- //
+
+function randomSalt(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes));
+}
+
+async function hashPbkdf2(password: string, salt: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(salt), iterations: 100_000 },
+    key,
+    256,
+  );
+  return btoa(String.fromCharCode(...new Uint8Array(bits)));
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i]! ^ bb[i]!;
+  return diff === 0;
 }
