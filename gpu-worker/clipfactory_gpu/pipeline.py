@@ -23,7 +23,7 @@ from .claude_copy import run_copy
 from .config import Config
 from .d1_api import D1Api
 from .deepgram import transcribe_safe, words_to_ass
-from .ffmpeg_recipes import SponsorConfig, build_cmd, build_hook_overlay_ass, run
+from .ffmpeg_recipes import SponsorConfig, build_cmd, run
 from .hook_generator import generate as hook_generate
 from .hook_scorer import score as hook_score
 from .r2_client import R2Client
@@ -177,7 +177,6 @@ def run_pipeline(
     final_path = work / "final.mp4"
     srt_path = work / "captions.srt"
     ass_path = work / "captions.ass"
-    hook_ass_path = work / "hook.ass"
     full_audio_path = work / "full_audio.m4a"
 
     try:
@@ -289,10 +288,6 @@ def run_pipeline(
         if any(s in hook_text.lower() for s in _HOOK_NON_CONTENT):
             log.warning("hook_text looks like a generator flag-back, suppressing burn-in: %r", hook_text)
             hook_text = ""
-        if hook_text:
-            ass = build_hook_overlay_ass(hook_text)
-            if ass:
-                hook_ass_path.write_text(ass, encoding="utf-8")
         d1.patch_clip(
             clip_id,
             {
@@ -314,7 +309,8 @@ def run_pipeline(
             trim_end=trim_end,
             subtitles_path=ass_path if ass_path.exists() else None,
             sponsor=sponsor,
-            hook_overlay_path=hook_ass_path if hook_ass_path.exists() else None,
+            hook_text=hook_text or None,
+            hook_font_path=cfg.hook_font_path if hook_text else None,
         )
         t0 = time.monotonic()
         try:

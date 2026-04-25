@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
 from pathlib import Path
 from typing import Any
 
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import RetryError, retry, stop_after_attempt, wait_fixed
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +53,95 @@ def _degraded(duration_sec: float) -> dict[str, Any]:
     }
 
 
+def _extract_json(text: str) -> dict[str, Any]:
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("substance scorer returned empty response text")
+
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*\n?", "", s)
+        s = re.sub(r"\n?```\s*$", "", s)
+
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", s)
+        if not m:
+            raise
+        data = json.loads(m.group(0))
+
+    if not isinstance(data, dict):
+        raise ValueError("substance scorer response must be a JSON object")
+    return data
+
+
+def _to_float(value: Any, *, field: str) -> float:
+    try:
+        out = float(value)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"{field} is not numeric: {value!r}") from e
+    if not math.isfinite(out):
+        raise ValueError(f"{field} is not finite: {value!r}")
+    return out
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _normalize_trim_window(
+    start: float,
+    end: float,
+    *,
+    duration_sec: float,
+    peak_ts: float,
+) -> tuple[float, float, bool]:
+    """Return a bounds-safe 10-40s trim window, preserving center when possible."""
+    orig_start = start
+    orig_end = end
+
+    if end < start:
+        start, end = end, start
+
+    max_dur = max(10.0, min(40.0, duration_sec))
+    dur = end - start
+    center = _clamp(peak_ts, 0.0, duration_sec)
+    if dur >= 10.0 and dur <= 40.0:
+        center = (start + end) / 2.0
+    target_dur = _clamp(dur if dur > 0 else 25.0, 10.0, max_dur)
+
+    half = target_dur / 2.0
+    start = center - half
+    end = center + half
+
+    if start < 0:
+        end -= start
+        start = 0.0
+    if end > duration_sec:
+        start -= (end - duration_sec)
+        end = duration_sec
+    start = max(0.0, start)
+    end = min(duration_sec, end)
+
+    if end - start < 10.0 and duration_sec >= 10.0:
+        end = min(duration_sec, start + 10.0)
+        start = max(0.0, end - 10.0)
+
+    changed = abs(start - orig_start) > 0.01 or abs(end - orig_end) > 0.01
+    return start, end, changed
+
+
+def _root_error_message(err: Exception) -> str:
+    if isinstance(err, RetryError):
+        try:
+            cause = err.last_attempt.exception()
+        except Exception:  # noqa: BLE001
+            cause = None
+        if cause:
+            return f"{type(cause).__name__}: {cause}"
+    return f"{type(err).__name__}: {err}"
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(10))
 def score(
     api_key: str,
@@ -78,6 +169,7 @@ def score(
         f"streamer: {streamer}\n"
         f"clip_duration_seconds: {duration_sec:.1f}\n"
         f"trigger_context: a trusted moderator typed !clip near T+85s of this window\n"
+        "output_constraint: recommended_trim_window must be 10-40 seconds and inside clip bounds\n"
         f"transcript:\n{transcript_excerpt[:6000]}"
     )
 
@@ -94,7 +186,7 @@ def score(
         ),
     )
     text = resp.text or ""
-    data = json.loads(text)
+    data = _extract_json(text)
     return _validate_and_extract(data, duration_sec)
 
 
@@ -105,24 +197,42 @@ def _validate_and_extract(d: dict[str, Any], duration_sec: float) -> dict[str, A
     if missing:
         raise ValueError(f"substance scorer response missing keys: {missing}")
 
+    rs = d.get("rule_scores", {}) or {}
+    rule1 = rs.get("1_peak_moment_clarity", {}) or {}
+    peak_ts = _to_float(
+        rule1.get("peak_timestamp_seconds", duration_sec / 2.0),
+        field="rule_scores.1_peak_moment_clarity.peak_timestamp_seconds",
+    )
+
     rt = d["recommended_trim_window"]
-    start = float(rt.get("start_seconds", 0))
-    end = float(rt.get("end_seconds", 0))
-    dur = end - start
-    if dur < 10 or dur > 40:
-        raise ValueError(f"substance scorer trim out of 10-40s range: {dur}")
-    if start < 0 or end > duration_sec + 0.5:
-        raise ValueError(f"trim out of clip bounds [0, {duration_sec}]: [{start}, {end}]")
+    if not isinstance(rt, dict):
+        raise ValueError("recommended_trim_window must be a JSON object")
+    start = _to_float(rt.get("start_seconds", 0), field="recommended_trim_window.start_seconds")
+    end = _to_float(rt.get("end_seconds", 0), field="recommended_trim_window.end_seconds")
+    start, end, changed = _normalize_trim_window(
+        start,
+        end,
+        duration_sec=duration_sec,
+        peak_ts=peak_ts,
+    )
+    if changed:
+        log.warning(
+            "substance scorer returned invalid trim; normalized [%.3f, %.3f] -> [%.3f, %.3f]",
+            _to_float(rt.get("start_seconds", 0), field="recommended_trim_window.start_seconds"),
+            _to_float(rt.get("end_seconds", 0), field="recommended_trim_window.end_seconds"),
+            start,
+            end,
+        )
+    rt["start_seconds"] = round(start, 3)
+    rt["end_seconds"] = round(end, 3)
 
     # Lift fields the rest of the pipeline needs from nested rule_scores.
-    rs = d.get("rule_scores", {})
-    rule1 = rs.get("1_peak_moment_clarity", {})
     rule2 = rs.get("2_emotional_arousal", {})
     rule4 = rs.get("4_quotable_memorable_beat", {})
     rule6 = rs.get("6_share_trigger", {})
 
     d["_extracted"] = {
-        "peak_timestamp_seconds": float(rule1.get("peak_timestamp_seconds", duration_sec / 2.0)),
+        "peak_timestamp_seconds": peak_ts,
         "peak_emotion": rule2.get("peak_emotion", "mixed"),
         "extractable_element": rule4.get("extractable_element", ""),
         "trigger_type": rule6.get("trigger_type", "none"),
@@ -151,5 +261,6 @@ def score_with_fallback(
             duration_sec=duration_sec,
         ), None
     except Exception as e:  # noqa: BLE001
-        log.warning("substance scorer failed, using degraded fallback: %s", e)
-        return _degraded(duration_sec), str(e)
+        detail = _root_error_message(e)
+        log.warning("substance scorer failed, using degraded fallback: %s", detail)
+        return _degraded(duration_sec), detail

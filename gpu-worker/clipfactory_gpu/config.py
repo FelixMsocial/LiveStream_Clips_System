@@ -2,10 +2,27 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+def _default_font_path() -> str:
+    """Return the best available bold sans-serif font for the current platform."""
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Windows\Fonts\arialbd.ttf",   # Arial Bold (virtually universal)
+            r"C:\Windows\Fonts\calibrib.ttf",   # Calibri Bold
+            r"C:\Windows\Fonts\tahoma.ttf",     # Tahoma
+        ]
+        for p in candidates:
+            if Path(p).exists():
+                return p
+        return r"C:\Windows\Fonts\arialbd.ttf"  # will warn at render time if absent
+    # Linux / Ubuntu server default
+    return "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
 
 @dataclass(frozen=True)
@@ -36,6 +53,7 @@ class Config:
     # FFmpeg
     ffmpeg_bin: str
     work_dir: str
+    hook_font_path: str   # absolute path to a bold sans-serif TTF on the GPU machine
 
     # Scoring / hook iteration thresholds
     substance_low_threshold: int      # weighted_total below this sets low_potential_flag
@@ -84,6 +102,9 @@ def load_config() -> Config:
         gpu_internal_secret=req("GPU_INTERNAL_SECRET"),
         ffmpeg_bin=os.environ.get("FFMPEG_BIN", "ffmpeg"),
         work_dir=os.environ.get("GPU_WORK_DIR", str(Path.cwd() / "tmp")),
+        # Override with HOOK_FONT_PATH in .env to use any TTF on the GPU machine.
+        # Defaults to Arial Bold on Windows, Liberation Sans Bold on Linux.
+        hook_font_path=os.environ.get("HOOK_FONT_PATH", _default_font_path()),
         substance_low_threshold=int(os.environ.get("SUBSTANCE_LOW_THRESHOLD", "50")),
         hook_pass_threshold=int(os.environ.get("HOOK_PASS_THRESHOLD", "65")),
         hook_alignment_floor=int(os.environ.get("HOOK_ALIGNMENT_FLOOR", "6")),
