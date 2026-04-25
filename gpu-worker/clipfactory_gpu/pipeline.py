@@ -15,12 +15,42 @@ from typing import Any
 from .claude_copy import run_copy
 from .config import Config
 from .d1_api import D1Api
-from .deepgram import transcribe_safe
+from .deepgram import transcribe_safe, words_to_ass
 from .ffmpeg_recipes import SponsorConfig, build_cmd, run
 from .gemini import analyze_with_fallback
 from .r2_client import R2Client
 
 log = logging.getLogger(__name__)
+
+
+def _extract_audio_for_asr(
+    ffmpeg_bin: str, src: Path, dst: Path, start: float, end: float
+) -> None:
+    """Trim audio precisely to the analysis window for transcription.
+
+    Uses accurate seek + AAC re-encode so the output begins exactly at
+    `start`; this guarantees Deepgram's word timestamps line up with the
+    final composite, which trims the same window from the same source.
+    """
+    import subprocess
+
+    duration = max(1.0, end - start)
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(src),
+        "-t", f"{duration:.3f}",
+        "-vn",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"asr audio extract failed (rc={proc.returncode}): {proc.stderr[-500:]}"
+        )
 
 
 def _probe_duration(ffmpeg_bin: str, path: Path) -> float:
@@ -59,6 +89,8 @@ def run_pipeline(
     raw_path = work / "raw.mp4"
     final_path = work / "final.mp4"
     srt_path = work / "captions.srt"
+    ass_path = work / "captions.ass"
+    asr_audio_path = work / "trimmed_for_asr.m4a"
 
     try:
         # 1. Download raw.
@@ -109,9 +141,19 @@ def run_pipeline(
             {"vision_analysis": json.dumps(vision, ensure_ascii=False)},
         )
 
-        # 3. Deepgram transcription.
+        # 3. Deepgram transcription — run on the trim window so SRT/ASS
+        # timestamps are relative to the final cut (no drift from the trim
+        # offset). We extract audio-only with an accurate seek for ASR.
+        trim = vision["recommended_trim"]
+        trim_start = float(trim["start_sec"])
+        trim_end = float(trim["end_sec"])
         t0 = time.monotonic()
-        srt_text, _words, deepgram_err = transcribe_safe(cfg.deepgram_api_key, raw_path)
+        _extract_audio_for_asr(
+            cfg.ffmpeg_bin, raw_path, asr_audio_path, trim_start, trim_end
+        )
+        srt_text, words, deepgram_err = transcribe_safe(
+            cfg.deepgram_api_key, asr_audio_path, content_type="audio/mp4"
+        )
         timings["transcribe"] = _ms_since(t0)
         if deepgram_err:
             _alert_issue(
@@ -126,18 +168,21 @@ def run_pipeline(
         if srt_text:
             srt_path.write_text(srt_text, encoding="utf-8")
             d1.patch_clip(clip_id, {"transcript_srt": srt_text})
+        if words:
+            ass_text = words_to_ass(words)
+            if ass_text:
+                ass_path.write_text(ass_text, encoding="utf-8")
 
         # 4. FFmpeg edit.
         d1.patch_clip(clip_id, {"status": "editing"})
-        trim = vision["recommended_trim"]
         sponsor = _load_sponsor(stream_session_id, work, r2) if stream_session_id else None
         cmd = build_cmd(
             ffmpeg_bin=cfg.ffmpeg_bin,
             input_path=raw_path,
             output_path=final_path,
-            trim_start=float(trim["start_sec"]),
-            trim_end=float(trim["end_sec"]),
-            subtitles_path=srt_path if srt_text else None,
+            trim_start=trim_start,
+            trim_end=trim_end,
+            subtitles_path=ass_path if ass_path.exists() else None,
             sponsor=sponsor,
         )
         t0 = time.monotonic()

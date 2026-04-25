@@ -20,7 +20,6 @@ import type { Env } from "./env.js";
 import { signJwt, verifyJwt } from "./jwt.js";
 
 const TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
-const VIDEO_ATTACH_MAX_BYTES = 49 * 1024 * 1024; // Telegram limit via bot API
 const PAGES_PROD_ORIGIN = "https://clipfactory.pages.dev";
 const APPROVAL_WINDOW_SECONDS = 20 * 60;
 const HEARTBEAT_DEAD_MS = 180_000; // 3 missed 60s beats — tolerates one transient failure
@@ -156,50 +155,28 @@ async function sendApprovalRequest(clipId: string, env: Env): Promise<void> {
 
   const caption = buildTelegramCaption(clip);
   let messageId: number | undefined;
-  const obj = await env.CLIP_BUCKET.head(clip.final_clip_r2_key);
-  const size = obj?.size ?? 0;
   const videoUrl = await buildFinalClipUrl(env, clip.final_clip_r2_key);
 
   const emailSubject = `ClipFactory — clip ${clipId} pending approval`;
   const emailHtml = `<p>${caption.replace(/\n/g, "<br>")}</p><p><a href="${videoUrl}">Watch clip</a></p><p><a href="${reviewUrl}">Review on dashboard</a></p>`;
 
-  if (size > 0 && size <= VIDEO_ATTACH_MAX_BYTES) {
-    const result = await sendTelegramWithFallback(
-      tg,
-      async () => {
-        const res = await tg.sendVideo({
-          chat_id: env.TELEGRAM_APPROVER_CHAT_ID,
-          video: videoUrl,
-          caption,
-          parse_mode: "HTML",
-          reply_markup: keyboard,
-          supports_streaming: true,
-        });
-        messageId = res.message_id;
-      },
-      env,
-      emailSubject,
-      emailHtml,
-    );
-    if (!result.ok) throw new Error("approval send failed via all channels");
-  } else {
-    const result = await sendTelegramWithFallback(
-      tg,
-      async () => {
-        const res = await tg.sendMessage({
-          chat_id: env.TELEGRAM_APPROVER_CHAT_ID,
-          text: `${caption}\n\n<a href="${videoUrl}">Watch clip</a>`,
-          parse_mode: "HTML",
-          reply_markup: keyboard,
-        });
-        messageId = res.message_id;
-      },
-      env,
-      emailSubject,
-      emailHtml,
-    );
-    if (!result.ok) throw new Error("approval send failed via all channels");
-  }
+  const result = await sendTelegramWithFallback(
+    tg,
+    async () => {
+      const res = await tg.sendMessage({
+        chat_id: env.TELEGRAM_APPROVER_CHAT_ID,
+        text: `${caption}\n\n<a href="${videoUrl}">Watch clip</a>`,
+        parse_mode: "HTML",
+        reply_markup: keyboard,
+        disable_web_page_preview: true,
+      });
+      messageId = res.message_id;
+    },
+    env,
+    emailSubject,
+    emailHtml,
+  );
+  if (!result.ok) throw new Error("approval send failed via all channels");
 
   await clipsDb.setStatus(env.CLIP_DB, clipId, "pending_approval", {
     telegram_message_id: messageId ?? null,

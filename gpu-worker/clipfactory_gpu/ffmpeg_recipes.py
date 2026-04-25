@@ -38,7 +38,6 @@ def build_cmd(
     trim_end: float,
     subtitles_path: Path | None,
     sponsor: SponsorConfig | None,
-    font_name: str = "Inter Black",
 ) -> list[str]:
     duration = max(1.0, trim_end - trim_start)
 
@@ -55,18 +54,16 @@ def build_cmd(
     )
     last = "framed"
 
-    # Burn-in captions.
+    # Burn-in captions. Style (font, colors, MarginV=576 ≈ 70% from top of
+    # the 1920px frame, karaoke palette) is owned by the ASS file produced
+    # by deepgram.words_to_ass — no force_style override here.
     if subtitles_path and subtitles_path.exists() and subtitles_path.stat().st_size > 0:
         # Escape backslashes and colons for ffmpeg's filtergraph parser.
         sub_escaped = (
             str(subtitles_path).replace("\\", "/").replace(":", r"\:")
         )
-        style = (
-            f"FontName={font_name},FontSize=18,PrimaryColour=&Hffffff&,"
-            f"OutlineColour=&H000000&,Outline=3,Alignment=2,MarginV=340"
-        )
         filter_parts.append(
-            f"[{last}]subtitles='{sub_escaped}':force_style='{style}'[captioned]"
+            f"[{last}]subtitles='{sub_escaped}'[captioned]"
         )
         last = "captioned"
 
