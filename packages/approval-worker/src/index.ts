@@ -211,29 +211,29 @@ async function sendApprovalRequest(clipId: string, env: Env): Promise<void> {
 }
 
 function buildTelegramCaption(clip: ClipRow): string {
-  const vibe = safeVibe(clip.vision_analysis);
-  const lines = [
-    `<b>ClipFactory</b> — pending approval`,
-    `• vibe: ${vibe}`,
-    `• triggered by: @${clip.triggered_by}`,
+  const triggeredAt = clip.triggered_at
+    ? new Date(clip.triggered_at).toISOString().slice(11, 16) + " UTC"
+    : null;
+  const duration = clip.duration_sec ? `${Math.round(clip.duration_sec)}s` : null;
+
+  const header = [
+    `🎬 <b>ClipFactory</b> — new clip ready for review`,
+    `• triggered by: @${clip.triggered_by}${triggeredAt ? ` at ${triggeredAt}` : ""}`,
+    duration ? `• duration: ${duration}` : "",
     clip.label ? `• label: ${clip.label}` : "",
-    "",
-    `<b>IG:</b> ${trunc(clip.instagram_post_text, 180)}`,
-    `<b>YT:</b> ${trunc(clip.youtube_post_text, 180)}`,
-    `<b>TT:</b> ${trunc(clip.tiktok_post_text, 180)}`,
-  ].filter(Boolean);
-  return lines.join("\n");
+  ].filter(Boolean).join("\n");
+
+  const posts = [
+    `📱 <b>Suggested posts:</b>`,
+    ``,
+    `<b>Instagram:</b> ${trunc(clip.instagram_post_text, 200)}`,
+    `<b>YouTube:</b> ${trunc(clip.youtube_post_text, 200)}`,
+    `<b>TikTok:</b> ${trunc(clip.tiktok_post_text, 200)}`,
+  ].join("\n");
+
+  return `${header}\n\n${posts}\n\n⏱ Auto-expires in 20 min.`;
 }
 
-function safeVibe(visionJson: string | null): string {
-  if (!visionJson) return "unknown";
-  try {
-    const v = JSON.parse(visionJson) as { vibe?: string };
-    return v.vibe ?? "unknown";
-  } catch {
-    return "unknown";
-  }
-}
 
 function trunc(s: string | null, n: number): string {
   if (!s) return "—";
@@ -727,7 +727,7 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
 
   // Dashboard login: POST /api/auth/login { username, password } → { token }
   if (url.pathname === "/api/auth/login" && req.method === "POST") {
-    const body = await req.json<{ username?: string; password?: string }>().catch(() => ({}));
+    const body = await req.json<{ username?: string; password?: string }>().catch(() => ({ username: undefined, password: undefined }));
     const username = (body.username ?? "").trim().toLowerCase();
     const password = body.password ?? "";
     if (!username || !password) return new Response("missing credentials", { status: 401 });
@@ -747,7 +747,7 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
   // Internal: POST /api/internal/setup-dashboard-user { username, password } — create/reset a user
   if (url.pathname === "/api/internal/setup-dashboard-user" && req.method === "POST") {
     if (!checkInternal(req, env)) return forbidden();
-    const body = await req.json<{ username?: string; password?: string }>().catch(() => ({}));
+    const body = await req.json<{ username?: string; password?: string }>().catch(() => ({ username: undefined, password: undefined }));
     const username = (body.username ?? "").trim().toLowerCase();
     const password = body.password ?? "";
     if (!username || password.length < 8) {

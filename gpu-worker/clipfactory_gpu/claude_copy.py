@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -56,9 +57,13 @@ def run_copy(
         try:
             text = _call(client, prompts[prompt_keys[k]], ctx)
             if k == "youtube":
-                # yt prompt returns JSON { title, description }.
+                # yt prompt returns JSON { title, description }, sometimes in markdown fences.
                 try:
-                    parsed = json.loads(text)
+                    clean = text.strip()
+                    if clean.startswith("```"):
+                        clean = re.sub(r"^```(?:json)?\s*\n?", "", clean)
+                        clean = re.sub(r"\n?```\s*$", "", clean)
+                    parsed = json.loads(clean)
                     text = f"{parsed.get('title', '')}\n{parsed.get('description', '')}".strip()
                 except Exception:
                     pass
