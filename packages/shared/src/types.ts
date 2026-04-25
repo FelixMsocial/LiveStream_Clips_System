@@ -73,6 +73,7 @@ export interface GpuTimingsMs {
 export interface ClipRow {
   id: string;
   twitch_clip_id: string | null;
+  twitch_edit_url: string | null;
   stream_session_id: string | null;
   triggered_by: string;
   triggered_at: string;

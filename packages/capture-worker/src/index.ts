@@ -8,6 +8,7 @@ import { clipsDb, type ClipIngestJob, type ClipEditJob } from "@clipfactory/shar
 import type { Env } from "./env.js";
 import {
   createClip,
+  extendClipDuration,
   getClipById,
   getClipPlaybackUrl,
   mp4UrlFromThumbnail,
@@ -54,6 +55,13 @@ async function handleOne(job: ClipIngestJob, env: Env): Promise<void> {
     broadcaster_id,
   );
 
+  // Best-effort: extend raw clip to 60 s before download. Falls back to 30 s default on failure.
+  await extendClipDuration(
+    env.TWITCH_CLIENT_ID,
+    env.TWITCH_BROADCASTER_OAUTH_TOKEN,
+    created.id,
+  ).catch((err) => console.warn("extendClipDuration failed, keeping 30s default:", err));
+
   const helixClip = await pollForClip(env, created.id);
   if (!helixClip) {
     await clipsDb.setStatus(env.CLIP_DB, clip_id, "failed_capture", {
@@ -93,6 +101,7 @@ async function handleOne(job: ClipIngestJob, env: Env): Promise<void> {
     twitch_clip_id: helixClip.id,
     raw_clip_r2_key: rawKey,
     duration_sec: helixClip.duration,
+    twitch_edit_url: created.edit_url,
   });
 
   const editJob: ClipEditJob = {

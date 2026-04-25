@@ -25,8 +25,8 @@ class SponsorConfig:
     is_video: bool = False
     remove_green: bool = False
     chroma_color: str = "0x00FF00"
-    chroma_similarity: float = 0.22
-    chroma_blend: float = 0.08
+    chroma_similarity: float = 0.28
+    chroma_blend: float = 0.0
 
 
 def build_cmd(

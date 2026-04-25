@@ -89,6 +89,31 @@ export async function createClip(
   return created;
 }
 
+export async function extendClipDuration(
+  clientId: string,
+  broadcasterToken: string,
+  clipId: string,
+  durationSec = 60,
+): Promise<void> {
+  const res = await fetch(GQL, {
+    method: "POST",
+    headers: {
+      "Client-ID": clientId,
+      Authorization: `Bearer ${stripBearerPrefix(broadcasterToken)}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      operationName: "EditClip",
+      variables: { input: { id: clipId, length: durationSec } },
+      query: `mutation EditClip($input: ClipEditInput!) { editClip(input: $input) { id duration } }`,
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`extendClipDuration ${res.status}: ${text}`);
+  const body = JSON.parse(text) as { errors?: { message: string }[] };
+  if (body.errors?.length) throw new Error(`extendClipDuration GQL: ${body.errors[0]!.message}`);
+}
+
 export async function getClipById(
   clientId: string,
   appTokenOrBroadcaster: string,
