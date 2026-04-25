@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 IDLE_SLEEP_SEC = 5.0
 HEARTBEAT_INTERVAL_SEC = 30.0
 PROMPT_REFRESH_SEC = 300.0  # Re-fetch prompts from D1 every 5 minutes
+ALERT_COOLDOWN_SEC = 900.0
 
 
 class Daemon:
@@ -47,6 +48,9 @@ class Daemon:
         self._running = True
         self._last_heartbeat = 0.0
         self._last_prompt_fetch = 0.0
+        self._heartbeat_failures = 0
+        self._pull_failures = 0
+        self._last_worker_alert: dict[str, float] = {}
         Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
 
     def stop(self, *_a: Any) -> None:
@@ -56,8 +60,28 @@ class Daemon:
     def _beat(self) -> None:
         if time.monotonic() - self._last_heartbeat < HEARTBEAT_INTERVAL_SEC:
             return
-        self.d1.heartbeat(self.cfg.gpu_heartbeat_url)
+        ok = self.d1.heartbeat(self.cfg.gpu_heartbeat_url)
+        if ok:
+            self._heartbeat_failures = 0
+        else:
+            self._heartbeat_failures += 1
+            if self._heartbeat_failures >= 3:
+                self._notify_worker_issue(
+                    "gpu_heartbeat_failure",
+                    (
+                        f"GPU heartbeat failed {self._heartbeat_failures} consecutive times. "
+                        f"worker_id={self.cfg.gpu_worker_id}"
+                    ),
+                )
         self._last_heartbeat = time.monotonic()
+
+    def _notify_worker_issue(self, alert_type: str, message: str) -> None:
+        now = time.monotonic()
+        last = self._last_worker_alert.get(alert_type, 0.0)
+        if now - last < ALERT_COOLDOWN_SEC:
+            return
+        self.d1.send_alert(alert_type=alert_type, message=message)
+        self._last_worker_alert[alert_type] = now
 
     def _load_prompts(self) -> None:
         """Load prompts from D1 API, falling back to hardcoded prompts_fallback."""
@@ -85,9 +109,19 @@ class Daemon:
                 msgs = self.q.pull(batch_size=1, visibility_ms=15 * 60 * 1000)
             except Exception as e:  # noqa: BLE001
                 log.warning("pull failed: %s", e)
+                self._pull_failures += 1
+                if self._pull_failures >= 3:
+                    self._notify_worker_issue(
+                        "queue_pull_failure",
+                        (
+                            "Cloudflare queue pull failed 3+ consecutive times. "
+                            f"worker_id={self.cfg.gpu_worker_id}. Last error: {e}"
+                        ),
+                    )
                 time.sleep(IDLE_SLEEP_SEC)
                 self._beat()
                 continue
+            self._pull_failures = 0
 
             if not msgs:
                 self._beat()
@@ -106,6 +140,10 @@ class Daemon:
         raw_key = body.get("raw_clip_r2_key")
         if not clip_id or not raw_key:
             log.error("bad payload, acking to skip: %s", body)
+            self.d1.send_alert(
+                alert_type="bad_queue_payload",
+                message=f"GPU worker received malformed CLIP_EDIT message: {body}",
+            )
             self.q.ack([m.lease_id])
             return
         try:
@@ -121,11 +159,25 @@ class Daemon:
             self.q.ack([m.lease_id])
         except Exception as e:  # noqa: BLE001
             log.exception("pipeline failed, retrying queue msg: %s", e)
+            if m.attempts >= 3:
+                self.d1.send_alert(
+                    clip_id=clip_id,
+                    alert_type="gpu_queue_retry_exhausted",
+                    message=(
+                        f"Clip edit job failed after {m.attempts} queue attempts. "
+                        f"clip_id={clip_id}. Last error: {e}"
+                    ),
+                )
             # Queues will redeliver after visibility_ms; we optionally nudge it sooner.
             try:
                 self.q.retry(m.lease_id, delay_seconds=60)
             except Exception:
                 log.exception("retry call failed")
+                self.d1.send_alert(
+                    clip_id=clip_id,
+                    alert_type="queue_retry_call_failed",
+                    message=f"Failed to request queue retry for clip_id={clip_id}",
+                )
 
 
 def main() -> None:

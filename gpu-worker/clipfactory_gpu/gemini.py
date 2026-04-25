@@ -85,9 +85,9 @@ def _validate(d: dict[str, Any]) -> dict[str, Any]:
 
 def analyze_with_fallback(
     api_key: str, video_path: Path, prompt_body: str, duration_sec: float
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str | None]:
     try:
-        return analyze(api_key, video_path, prompt_body)
+        return analyze(api_key, video_path, prompt_body), None
     except Exception as e:  # noqa: BLE001
         log.warning("gemini failed, falling back to degraded midpoint trim: %s", e)
-        return _degraded(duration_sec)
+        return _degraded(duration_sec), str(e)

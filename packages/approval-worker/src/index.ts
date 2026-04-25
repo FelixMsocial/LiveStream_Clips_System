@@ -22,6 +22,7 @@ import { signJwt, verifyJwt } from "./jwt.js";
 const TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
 const VIDEO_ATTACH_MAX_BYTES = 49 * 1024 * 1024; // Telegram limit via bot API
 const PAGES_PROD_ORIGIN = "https://clipfactory.pages.dev";
+const APPROVAL_WINDOW_SECONDS = 20 * 60;
 
 export default {
   async queue(batch: MessageBatch<ApprovalSendJob>, env: Env): Promise<void> {
@@ -53,7 +54,7 @@ export default {
     if (req.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
       return new Response(null, {
         status: 204,
-        headers: buildCorsHeaders(req.headers.get("origin")),
+        headers: buildCorsHeaders(req.headers.get("origin"), env),
       });
     }
 
@@ -91,7 +92,7 @@ export default {
     // Internal APIs (GPU worker, dashboard).
     if (url.pathname.startsWith("/api/")) {
       const res = await handleApi(req, url, env);
-      return withCors(req, res);
+      return withCors(req, res, env);
     }
 
     return new Response("clip-approval", { status: 200 });
@@ -138,9 +139,9 @@ async function sendApprovalRequest(clipId: string, env: Env): Promise<void> {
   const token = await signJwt(
     env.DASHBOARD_JWT_SECRET,
     { clip_id: clipId, purpose: "review" },
-    1800,
+    APPROVAL_WINDOW_SECONDS,
   );
-  const reviewUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review/${clipId}?t=${token}`;
+  const reviewUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review?id=${clipId}&t=${token}`;
 
   const keyboard = {
     inline_keyboard: [
@@ -287,32 +288,56 @@ async function handleTelegramUpdate(update: TelegramUpdate, env: Env): Promise<v
 
   if (update.callback_query) {
     const cq = update.callback_query;
-    const userId = String(cq.from.id);
-    if (!(await clipsDb.isApprover(env.CLIP_DB, userId))) {
-      await tg.answerCallbackQuery({
-        callback_query_id: cq.id,
-        text: "Not authorized.",
-        show_alert: true,
-      });
-      return;
-    }
-    const [action, clipId] = cq.data.split(":");
-    if (!action || !clipId) {
-      await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Bad payload" });
-      return;
-    }
+    // Always answer the callback query — Telegram times out after 10s if we don't.
+    try {
+      const userId = String(cq.from.id);
+      // Authorize: approvers table, personal DM match, or member of the approver chat.
+      if (!(await isApproverAuthorized(env, userId, cq.message.chat.id))) {
+        await tg.answerCallbackQuery({
+          callback_query_id: cq.id,
+          text: "Not authorized.",
+          show_alert: true,
+        });
+        return;
+      }
+      // callback_data is "action:clipId" — clipId may contain dashes but no colons.
+      const colonIdx = cq.data.indexOf(":");
+      const action = colonIdx === -1 ? cq.data : cq.data.slice(0, colonIdx);
+      const clipId = colonIdx === -1 ? "" : cq.data.slice(colonIdx + 1);
+      if (!action || !clipId) {
+        await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Bad payload" });
+        return;
+      }
 
-    if (action === "approve") {
-      await approveClip(clipId, userId, env, tg, cq.message.chat.id, cq.message.message_id);
-      await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Approved." });
-    } else if (action === "reject") {
-      await rejectClip(clipId, userId, null, env, tg, cq.message.chat.id, cq.message.message_id);
-      await tg.answerCallbackQuery({ callback_query_id: cq.id, text: "Rejected." });
-    } else {
-      await tg.answerCallbackQuery({
-        callback_query_id: cq.id,
-        text: `Unknown action: ${action}`,
-      });
+      if (action === "approve") {
+        const ok = await approveClip(clipId, userId, env, tg, cq.message.chat.id, cq.message.message_id);
+        await tg.answerCallbackQuery({
+          callback_query_id: cq.id,
+          text: ok ? "Approved." : "Clip already resolved.",
+        });
+      } else if (action === "reject") {
+        const ok = await rejectClip(clipId, userId, null, env, tg, cq.message.chat.id, cq.message.message_id);
+        await tg.answerCallbackQuery({
+          callback_query_id: cq.id,
+          text: ok ? "Rejected." : "Clip already resolved.",
+        });
+      } else {
+        await tg.answerCallbackQuery({
+          callback_query_id: cq.id,
+          text: `Unknown action: ${action}`,
+        });
+      }
+    } catch (err) {
+      console.error("callback_query handling error", err);
+      try {
+        await tg.answerCallbackQuery({
+          callback_query_id: cq.id,
+          text: "Error processing request. Please try again.",
+          show_alert: true,
+        });
+      } catch {
+        // best-effort; Telegram may have already timed out the query
+      }
     }
   }
 }
@@ -326,9 +351,9 @@ async function approveClip(
   tg: TelegramClient,
   chatId: number,
   messageId: number,
-): Promise<void> {
+): Promise<boolean> {
   const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
-  if (!clip || clip.status !== "pending_approval") return;
+  if (!clip || clip.status !== "pending_approval") return false;
   await clipsDb.setStatus(env.CLIP_DB, clipId, "approved", {
     approver_decision: "approved",
     approved_at: new Date().toISOString(),
@@ -337,8 +362,9 @@ async function approveClip(
   const job: PostDispatchJob = { clip_id: clipId, approved_by: actor };
   await env.POST_DISPATCH.send(job);
   await tg
-    .editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: undefined })
+    .editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } })
     .catch(() => {});
+  return true;
 }
 
 async function rejectClip(
@@ -349,17 +375,18 @@ async function rejectClip(
   tg: TelegramClient,
   chatId: number,
   messageId: number,
-): Promise<void> {
+): Promise<boolean> {
   const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
-  if (!clip || clip.status !== "pending_approval") return;
+  if (!clip || clip.status !== "pending_approval") return false;
   await clipsDb.setStatus(env.CLIP_DB, clipId, "rejected", {
     approver_decision: "rejected",
     approver_reason: reason,
   });
   await clipsDb.appendApprovalLog(env.CLIP_DB, clipId, "rejected", actor, { reason });
   await tg
-    .editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: undefined })
+    .editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } })
     .catch(() => {});
+  return true;
 }
 
 // -------------------- Cron: reminders + expiry -------------------- //
@@ -374,7 +401,8 @@ async function sweepPending(env: Env): Promise<void> {
      WHERE status = 'pending_approval'
        AND reminder_sent = 0
        AND sent_at IS NOT NULL
-       AND sent_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-10 minutes')`,
+       AND sent_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-10 minutes')
+       AND sent_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes')`,
   ).all<{ id: string; sent_at: string }>();
   // Send Telegram notifications first, then batch all D1 writes together
   const reminderSuccessIds: Array<{ id: string; channel: string }> = [];
@@ -408,7 +436,7 @@ async function sweepPending(env: Env): Promise<void> {
       );
       stmts.push(
         env.CLIP_DB.prepare(
-          `INSERT INTO approval_log (clip_id, action, actor, detail, ts) VALUES (?1, 'reminder', 'cron', ?2, datetime('now'))`,
+          `INSERT INTO approval_log (clip_id, event_type, actor, details, event_at) VALUES (?1, 'reminder', 'cron', ?2, datetime('now'))`,
         ).bind(id, JSON.stringify({ channel })),
       );
     }
@@ -429,12 +457,16 @@ async function sweepPending(env: Env): Promise<void> {
     for (const r of expired.results ?? []) {
       expiryStmts.push(
         env.CLIP_DB.prepare(
-          `UPDATE clips SET status = 'expired', updated_at = datetime('now') WHERE id = ?1`,
+          `UPDATE clips
+             SET status = 'expired',
+                 approver_decision = 'expired',
+                 updated_at = datetime('now')
+           WHERE id = ?1`,
         ).bind(r.id),
       );
       expiryStmts.push(
         env.CLIP_DB.prepare(
-          `INSERT INTO approval_log (clip_id, action, actor, detail, ts) VALUES (?1, 'expired', 'cron', NULL, datetime('now'))`,
+          `INSERT INTO approval_log (clip_id, event_type, actor, details, event_at) VALUES (?1, 'expired', 'cron', NULL, datetime('now'))`,
         ).bind(r.id),
       );
     }
@@ -605,14 +637,37 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
   if (clipMatch && req.method === "GET") {
     const clipId = clipMatch[1]!;
     const token = url.searchParams.get("t") ?? "";
-    const ok = await verifyJwt<{ clip_id: string }>(env.DASHBOARD_JWT_SECRET, token);
+    const ok = await verifyJwt<{ clip_id: string; purpose?: string }>(env.DASHBOARD_JWT_SECRET, token);
     if (!ok || ok.clip_id !== clipId) return forbidden();
-    const row = await clipsDb.getClip(env.CLIP_DB, clipId);
+    const row = await getClipForActiveReview(env, clipId);
+    if (row === "expired") return new Response("review window expired", { status: 410 });
     if (!row) return new Response("not found", { status: 404 });
     const videoUrl = row.final_clip_r2_key
-      ? await buildFinalClipUrl(env, row.final_clip_r2_key)
+      ? `/api/clips/${clipId}/video?t=${encodeURIComponent(token)}`
       : null;
     return Response.json({ clip: row, video_url: videoUrl });
+  }
+
+  // Dashboard: GET /api/clips/:id/video?t=... (proxied video for reliable playback)
+  const clipVideoMatch = /^\/api\/clips\/([^/]+)\/video$/.exec(url.pathname);
+  if (clipVideoMatch && req.method === "GET") {
+    const clipId = clipVideoMatch[1]!;
+    const token = url.searchParams.get("t") ?? "";
+    const ok = await verifyJwt<{ clip_id: string; purpose?: string }>(env.DASHBOARD_JWT_SECRET, token);
+    if (!ok || ok.clip_id !== clipId) return forbidden();
+    const row = await getClipForActiveReview(env, clipId);
+    if (row === "expired") return new Response("review window expired", { status: 410 });
+    if (!row) return new Response("not found", { status: 404 });
+    if (!row.final_clip_r2_key) return new Response("clip video unavailable", { status: 404 });
+    const obj = await env.CLIP_BUCKET.get(row.final_clip_r2_key);
+    if (!obj) return new Response("clip video unavailable", { status: 404 });
+
+    const headers = new Headers();
+    obj.writeHttpMetadata(headers);
+    headers.set("etag", obj.httpEtag);
+    if (!headers.has("content-type")) headers.set("content-type", "video/mp4");
+    headers.set("cache-control", "private, max-age=60");
+    return new Response(obj.body, { headers });
   }
 
   // Dashboard: POST /api/clips/:id/decision  { action, reason?, edits? }
@@ -620,7 +675,7 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
   if (decisionMatch && req.method === "POST") {
     const clipId = decisionMatch[1]!;
     const token = url.searchParams.get("t") ?? "";
-    const ok = await verifyJwt<{ clip_id: string }>(env.DASHBOARD_JWT_SECRET, token);
+    const ok = await verifyJwt<{ clip_id: string; purpose?: string }>(env.DASHBOARD_JWT_SECRET, token);
     if (!ok || ok.clip_id !== clipId) return forbidden();
     const body = await req.json<{
       action: "approve" | "reject" | "save";
@@ -629,7 +684,8 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     }>();
     const actor = "dashboard";
     const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
-    const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+    const clip = await getClipForActiveReview(env, clipId);
+    if (clip === "expired") return new Response("review window expired", { status: 410 });
     if (!clip) return new Response("not found", { status: 404 });
 
     if (body.edits) {
@@ -646,9 +702,11 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     const msgId = clip.telegram_message_id ?? 0;
 
     if (body.action === "approve") {
-      await approveClip(clipId, actor, env, tg, chatId, msgId);
+      const changed = await approveClip(clipId, actor, env, tg, chatId, msgId);
+      if (!changed) return new Response("clip is no longer pending approval", { status: 409 });
     } else if (body.action === "reject") {
-      await rejectClip(clipId, actor, body.reason ?? null, env, tg, chatId, msgId);
+      const changed = await rejectClip(clipId, actor, body.reason ?? null, env, tg, chatId, msgId);
+      if (!changed) return new Response("clip is no longer pending approval", { status: 409 });
     } // else "save" — edits were already applied above.
     return Response.json({ ok: true });
   }
@@ -728,12 +786,45 @@ function checkInternal(req: Request, env: Env): boolean {
   return !!env.GPU_INTERNAL_SECRET && auth === `Bearer ${env.GPU_INTERNAL_SECRET}`;
 }
 
+async function isApproverAuthorized(
+  env: Env,
+  telegramUserId: string,
+  messageChatId?: number,
+): Promise<boolean> {
+  // Explicit approvers table (any individual).
+  if (await clipsDb.isApprover(env.CLIP_DB, telegramUserId)) return true;
+  // Personal DM: user ID equals the approver chat ID (1-on-1 bot chat).
+  if (telegramUserId === String(env.TELEGRAM_APPROVER_CHAT_ID)) return true;
+  // Group/channel: callback came from within the configured approver chat.
+  // Anyone who can see and click the button inside that chat is authorized.
+  if (messageChatId !== undefined && String(messageChatId) === String(env.TELEGRAM_APPROVER_CHAT_ID)) return true;
+  return false;
+}
+
+function isReviewWindowOpen(sentAt: string | null, nowMs = Date.now()): boolean {
+  if (!sentAt) return false;
+  const sentMs = Date.parse(sentAt);
+  if (!Number.isFinite(sentMs)) return false;
+  return nowMs - sentMs <= APPROVAL_WINDOW_SECONDS * 1000;
+}
+
+async function getClipForActiveReview(
+  env: Env,
+  clipId: string,
+): Promise<ClipRow | "expired" | null> {
+  const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+  if (!clip) return null;
+  if (clip.status !== "pending_approval") return "expired";
+  if (!isReviewWindowOpen(clip.sent_at)) return "expired";
+  return clip;
+}
+
 function forbidden(): Response {
   return new Response("forbidden", { status: 403 });
 }
 
-function withCors(req: Request, res: Response): Response {
-  const cors = buildCorsHeaders(req.headers.get("origin"));
+function withCors(req: Request, res: Response, env: Env): Response {
+  const cors = buildCorsHeaders(req.headers.get("origin"), env);
   let hasCors = false;
   for (const _ of cors.entries()) {
     hasCors = true;
@@ -750,11 +841,19 @@ function withCors(req: Request, res: Response): Response {
   });
 }
 
-function buildCorsHeaders(origin: string | null): Headers {
+function buildCorsHeaders(origin: string | null, env: Env): Headers {
   const h = new Headers();
   if (!origin) return h;
 
-  if (origin === PAGES_PROD_ORIGIN || origin.endsWith(".clipfactory.pages.dev")) {
+  const dashboardOrigin = safeOrigin(env.DASHBOARD_URL);
+  if (
+    origin === dashboardOrigin ||
+    origin === PAGES_PROD_ORIGIN ||
+    origin.endsWith(".clipfactory.pages.dev") ||
+    /^https:\/\/[a-z0-9-]+\.pages\.dev$/i.test(origin) ||
+    /^http:\/\/localhost(:\d+)?$/i.test(origin) ||
+    /^http:\/\/127\.0\.0\.1(:\d+)?$/i.test(origin)
+  ) {
     h.set("access-control-allow-origin", origin);
     h.set("access-control-allow-methods", "GET,POST,PATCH,OPTIONS");
     h.set("access-control-allow-headers", "authorization,content-type");
@@ -762,4 +861,12 @@ function buildCorsHeaders(origin: string | null): Headers {
     h.set("vary", "origin");
   }
   return h;
+}
+
+function safeOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
 }

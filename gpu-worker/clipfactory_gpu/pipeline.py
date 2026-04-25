@@ -69,6 +69,15 @@ def run_pipeline(
             # If object missing (common after manual bucket wipes), skip job cleanly
             if "404" in str(e) or "Not Found" in str(e):
                 log.warning("raw clip missing in R2, skipping: %s (%s)", raw_clip_r2_key, clip_id)
+                _alert_issue(
+                    d1,
+                    clip_id=clip_id,
+                    alert_type="raw_clip_missing",
+                    message=(
+                        f"Raw clip object was missing in R2. "
+                        f"raw_key={raw_clip_r2_key}"
+                    ),
+                )
                 d1.patch_clip(
                     clip_id,
                     {"status": "missing_raw", "gpu_timings_ms": json.dumps(timings)},
@@ -81,10 +90,20 @@ def run_pipeline(
 
         # 2. Gemini analysis.
         t0 = time.monotonic()
-        vision = analyze_with_fallback(
+        vision, gemini_err = analyze_with_fallback(
             cfg.gemini_api_key, raw_path, prompts["gemini_analysis"], duration_sec
         )
         timings["vision"] = _ms_since(t0)
+        if gemini_err:
+            _alert_issue(
+                d1,
+                clip_id=clip_id,
+                alert_type="gemini_api_failure",
+                message=(
+                    "Gemini analysis failed after 3 attempts; "
+                    f"using degraded midpoint trim fallback. Error: {gemini_err}"
+                ),
+            )
         d1.patch_clip(
             clip_id,
             {"vision_analysis": json.dumps(vision, ensure_ascii=False)},
@@ -92,8 +111,18 @@ def run_pipeline(
 
         # 3. Deepgram transcription.
         t0 = time.monotonic()
-        srt_text, _words = transcribe_safe(cfg.deepgram_api_key, raw_path)
+        srt_text, _words, deepgram_err = transcribe_safe(cfg.deepgram_api_key, raw_path)
         timings["transcribe"] = _ms_since(t0)
+        if deepgram_err:
+            _alert_issue(
+                d1,
+                clip_id=clip_id,
+                alert_type="deepgram_api_failure",
+                message=(
+                    "Deepgram transcription failed after 3 attempts; "
+                    f"continuing without captions. Error: {deepgram_err}"
+                ),
+            )
         if srt_text:
             srt_path.write_text(srt_text, encoding="utf-8")
             d1.patch_clip(clip_id, {"transcript_srt": srt_text})
@@ -112,19 +141,37 @@ def run_pipeline(
             sponsor=sponsor,
         )
         t0 = time.monotonic()
-        run(cmd)
+        try:
+            _run_with_retries("ffmpeg", 3, lambda: run(cmd))
+        except Exception as e:  # noqa: BLE001
+            _alert_issue(
+                d1,
+                clip_id=clip_id,
+                alert_type="ffmpeg_failure",
+                message=f"FFmpeg composition failed after 3 attempts. Error: {e}",
+            )
+            raise
         timings["ffmpeg"] = _ms_since(t0)
 
         # 5. Upload final.
         final_key = f"final/{clip_id}.mp4"
         t0 = time.monotonic()
-        r2.upload(final_path, final_key)
+        try:
+            _run_with_retries("r2_upload", 3, lambda: r2.upload(final_path, final_key))
+        except Exception as e:  # noqa: BLE001
+            _alert_issue(
+                d1,
+                clip_id=clip_id,
+                alert_type="r2_upload_failure",
+                message=f"Final video upload to R2 failed after 3 attempts. Error: {e}",
+            )
+            raise
         timings["upload"] = _ms_since(t0)
         d1.patch_clip(clip_id, {"final_clip_r2_key": final_key})
 
         # 6. Claude copy × 3.
         t0 = time.monotonic()
-        copy_out = run_copy(
+        copy_out, claude_failures = run_copy(
             cfg.anthropic_api_key,
             prompts,
             vision,
@@ -132,6 +179,19 @@ def run_pipeline(
             str(vision.get("vibe", "unknown")),
         )
         timings["copy"] = _ms_since(t0)
+        if claude_failures:
+            detail = "; ".join(
+                f"{platform}={err}" for platform, err in claude_failures.items()
+            )
+            _alert_issue(
+                d1,
+                clip_id=clip_id,
+                alert_type="claude_copy_failure",
+                message=(
+                    "Claude copy generation failed after 3 attempts for one or more "
+                    f"platforms; fallback text used. Details: {detail}"
+                ),
+            )
 
         d1.patch_clip(
             clip_id,
@@ -145,10 +205,28 @@ def run_pipeline(
         )
 
         # 7. Trigger approval send.
-        d1.trigger_approval_send(clip_id)
+        try:
+            d1.trigger_approval_send(clip_id)
+        except Exception as e:  # noqa: BLE001
+            _alert_issue(
+                d1,
+                clip_id=clip_id,
+                alert_type="approval_send_failure",
+                message=(
+                    "Final clip rendered and uploaded, but approval notification "
+                    f"failed after 3 attempts. Error: {e}"
+                ),
+            )
+            log.exception("approval-send failed for %s", clip_id)
 
     except Exception as e:
         log.exception("pipeline failed for %s: %s", clip_id, e)
+        _alert_issue(
+            d1,
+            clip_id=clip_id,
+            alert_type="gpu_pipeline_failure",
+            message=f"GPU pipeline failed during editing flow. Error: {e}",
+        )
         try:
             d1.patch_clip(
                 clip_id,
@@ -198,3 +276,32 @@ def _first_quotes(vision: dict[str, Any]) -> str:
 
 def _ms_since(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
+
+
+def _run_with_retries(stage: str, attempts: int, fn: Any) -> Any:
+    last: Exception | None = None
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i == attempts:
+                raise
+            backoff = min(2 ** i, 8)
+            log.warning("%s failed (%d/%d): %s; retrying in %ss", stage, i, attempts, e, backoff)
+            time.sleep(backoff)
+    raise RuntimeError(f"{stage} failed unexpectedly: {last}")
+
+
+def _alert_issue(
+    d1: D1Api,
+    *,
+    clip_id: str,
+    alert_type: str,
+    message: str,
+) -> None:
+    d1.send_alert(
+        clip_id=clip_id,
+        alert_type=alert_type,
+        message=message,
+    )

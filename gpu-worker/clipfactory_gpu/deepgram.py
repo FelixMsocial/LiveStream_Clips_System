@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 log = logging.getLogger(__name__)
 
 URL = "https://api.deepgram.com/v1/listen"
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def transcribe(api_key: str, video_path: Path) -> tuple[str, list[dict[str, Any]]]:
     """Returns (srt_text, words)."""
     params = {
@@ -41,12 +43,15 @@ def transcribe(api_key: str, video_path: Path) -> tuple[str, list[dict[str, Any]
     return _words_to_srt(words), words
 
 
-def transcribe_safe(api_key: str, video_path: Path) -> tuple[str, list[dict[str, Any]]]:
+def transcribe_safe(
+    api_key: str, video_path: Path
+) -> tuple[str, list[dict[str, Any]], str | None]:
     try:
-        return transcribe(api_key, video_path)
+        srt, words = transcribe(api_key, video_path)
+        return srt, words, None
     except Exception as e:  # noqa: BLE001
         log.warning("deepgram failed — continuing with empty captions: %s", e)
-        return "", []
+        return "", [], str(e)
 
 
 def _words_to_srt(

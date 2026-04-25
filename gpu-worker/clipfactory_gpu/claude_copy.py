@@ -39,8 +39,8 @@ def run_copy(
     vibe: str,
     *,
     fallback_url: str | None = None,
-) -> dict[str, str]:
-    """Returns {'instagram': str, 'youtube': str, 'tiktok': str}."""
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Returns ({'instagram': str, 'youtube': str, 'tiktok': str}, failures)."""
     client = Anthropic(api_key=api_key)
     ctx = {
         "vision_analysis": vision_analysis,
@@ -48,6 +48,7 @@ def run_copy(
         "vibe": vibe,
     }
     out: dict[str, str] = {}
+    failures: dict[str, str] = {}
     keys = ("instagram", "youtube", "tiktok")
     prompt_keys = {"instagram": "ig_copy", "youtube": "yt_copy", "tiktok": "tt_copy"}
 
@@ -64,7 +65,8 @@ def run_copy(
             out[k] = text
         except Exception as e:  # noqa: BLE001
             log.warning("claude %s copy failed: %s", k, e)
+            failures[k] = str(e)
             out[k] = fallback_url or "🔴 Live now"
         if i < len(keys) - 1:
             time.sleep(10)  # HR-learning spacing
-    return out
+    return out, failures

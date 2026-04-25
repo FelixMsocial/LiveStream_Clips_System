@@ -50,24 +50,49 @@
     </div>
   </div>
   <script>
-    const DEFAULT_API = "https://clip-approval.missioncontrol5mof.workers.dev";
-    const API = (window.CLIPFACTORY_API ?? DEFAULT_API).replace(/\/$/, "");
+    const API = (window.CLIPFACTORY_API ?? "").replace(/\/$/, "");
     const params = new URLSearchParams(location.search);
     const token = params.get("t") ?? "";
-    const clipId = location.pathname.split("/").pop();
+    // Extract clip ID: prefer explicit ?id= param, then non-"review" path segment,
+    // then fall back to decoding it from the JWT payload (handles any URL shape).
+    const clipId = (() => {
+      const fromParam = params.get("id");
+      if (fromParam) return fromParam;
+      const seg = location.pathname.split("/").filter(Boolean).pop() ?? "";
+      if (seg && seg !== "review") return seg;
+      try {
+        const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+        return payload.clip_id ?? "";
+      } catch { return ""; }
+    })();
+
+    function apiUrl(path) {
+      return API ? `${API}${path}` : path;
+    }
 
     async function load() {
-      const res = await fetch(`${API}/api/clips/${clipId}?t=${encodeURIComponent(token)}`);
-      if (!res.ok) { show("Unauthorized or expired link.", true); return; }
-      const { clip, video_url } = await res.json();
-      document.getElementById("player").src = video_url;
-      document.getElementById("title").textContent = `Clip ${clip.id.slice(0,8)} · ${clip.status}`;
-      document.getElementById("meta").textContent = `@${clip.triggered_by} · ${clip.triggered_at}`;
-      document.getElementById("ig").value = clip.instagram_post_text ?? "";
-      document.getElementById("yt").value = clip.youtube_post_text ?? "";
-      document.getElementById("tt").value = clip.tiktok_post_text ?? "";
-      if (clip.vision_analysis) {
-        try { document.getElementById("vision").textContent = JSON.stringify(JSON.parse(clip.vision_analysis), null, 2); } catch {}
+      try {
+        if (!clipId || !token) {
+          show("Missing review token or clip id.", true);
+          return;
+        }
+        const res = await fetch(apiUrl(`/api/clips/${clipId}?t=${encodeURIComponent(token)}`));
+        if (!res.ok) {
+          show(res.status === 410 ? "Review link expired." : "Unauthorized or expired link.", true);
+          return;
+        }
+        const { clip } = await res.json();
+        document.getElementById("player").src = apiUrl(`/api/clips/${clipId}/video?t=${encodeURIComponent(token)}`);
+        document.getElementById("title").textContent = `Clip ${clip.id.slice(0,8)} · ${clip.status}`;
+        document.getElementById("meta").textContent = `@${clip.triggered_by} · ${clip.triggered_at}`;
+        document.getElementById("ig").value = clip.instagram_post_text ?? "";
+        document.getElementById("yt").value = clip.youtube_post_text ?? "";
+        document.getElementById("tt").value = clip.tiktok_post_text ?? "";
+        if (clip.vision_analysis) {
+          try { document.getElementById("vision").textContent = JSON.stringify(JSON.parse(clip.vision_analysis), null, 2); } catch {}
+        }
+      } catch (err) {
+        show("Failed to load clip review.", true);
       }
     }
     function edits() {
@@ -80,16 +105,16 @@
     async function decide(action) {
       const body = { action, edits: edits() };
       if (action === "reject") body.reason = document.getElementById("reason").value || null;
-      const res = await fetch(`${API}/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`, {
+      const res = await fetch(apiUrl(`/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
       if (res.ok) show(action === "approve" ? "Approved — dispatching." : "Rejected.");
-      else show("Request failed: " + res.status, true);
+      else show((res.status === 410 ? "Review link expired." : "Request failed") + ` (${res.status})`, true);
     }
     async function save() {
-      const res = await fetch(`${API}/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`, {
+      const res = await fetch(apiUrl(`/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ action: "save", edits: edits() }),

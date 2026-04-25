@@ -37,13 +37,15 @@
   </main>
 
   <script>
-    const DEFAULT_API = "https://clip-approval.missioncontrol5mof.workers.dev";
-    const API = (window.CLIPFACTORY_API ?? DEFAULT_API).replace(/\/$/, "");
+    const API = (window.CLIPFACTORY_API ?? "").replace(/\/$/, "");
+    function apiUrl(path) {
+      return API ? `${API}${path}` : path;
+    }
     // Dashboard JWT token from URL query param ?t=<jwt>
     const DASH_TOKEN = new URLSearchParams(window.location.search).get("t") ?? "";
     async function load() {
       try {
-        const res = await fetch(`${API}/api/dashboard?t=${encodeURIComponent(DASH_TOKEN)}`);
+        const res = await fetch(apiUrl(`/api/dashboard?t=${encodeURIComponent(DASH_TOKEN)}`));
         if (res.status === 403) {
           document.getElementById("updated").textContent = "Access denied — invalid or expired token";
           return;
