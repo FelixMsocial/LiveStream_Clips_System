@@ -5,56 +5,266 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>ClipFactory review</title>
   <style>
-    :root { color-scheme: dark; --bg:#0b0d11; --panel:#151821; --muted:#8a93a6; --fg:#e7ecf3; --ok:#27d07f; --err:#ff6472; --accent:#4f8cff; }
-    body { margin:0; font:14px/1.4 ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
-    .wrap { display:grid; grid-template-columns: minmax(280px, 420px) 1fr; gap:20px; padding:24px; max-width:1200px; margin:0 auto; }
-    video { width:100%; border-radius:10px; background:#000; aspect-ratio:9/16; }
-    .panel { background:var(--panel); border-radius:10px; padding:16px; }
-    textarea { width:100%; min-height:90px; background:#0b0d11; color:var(--fg); border:1px solid #2a2f3a; border-radius:8px; padding:10px; font:inherit; }
-    label { display:block; color:var(--muted); font-size:12px; margin:12px 0 6px; text-transform:uppercase; letter-spacing:.05em; }
-    button { padding:10px 18px; border-radius:8px; border:0; cursor:pointer; font-weight:600; margin-right:8px; }
-    .approve { background:var(--ok); color:#042313; }
-    .reject { background:var(--err); color:#2b0308; }
-    .save { background:#2a2f3a; color:var(--fg); }
-    .meta { color:var(--muted); margin-bottom:12px; }
-    .msg { margin-top:12px; padding:10px; border-radius:8px; background:#23262f; }
-    h1 { margin:0 0 4px; font-size:18px; }
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d11;
+      --panel: #151821;
+      --muted: #8a93a6;
+      --fg: #e7ecf3;
+      --ok: #27d07f;
+      --err: #ff6472;
+      --accent: #4f8cff;
+      --border: #2a2f3a;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+
+    /* ── Header ── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 20px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .header-logo {
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: -.01em;
+      color: var(--fg);
+    }
+    .header-logo span { color: var(--accent); }
+    .header-badge {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--muted);
+      background: #1e2231;
+      padding: 3px 10px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+    }
+
+    /* ── Two-column layout ── */
+    .wrap {
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) 1fr;
+      gap: 20px;
+      padding: 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+      align-items: start;
+    }
+
+    /* ── Left column ── */
+    .left-col { display: flex; flex-direction: column; gap: 12px; }
+
+    video {
+      width: 100%;
+      border-radius: 10px;
+      background: #000;
+      aspect-ratio: 9/16;
+      display: block;
+    }
+
+    /* ── Clip info card ── */
+    .clip-info {
+      background: var(--panel);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .clip-info h1 {
+      margin: 0 0 2px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .clip-meta {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* ── Right panel ── */
+    .panel {
+      background: var(--panel);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .panel-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin: 0 0 14px;
+    }
+
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      margin: 16px 0 5px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    label:first-of-type { margin-top: 0; }
+
+    textarea {
+      width: 100%;
+      min-height: 88px;
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: inherit;
+      resize: vertical;
+      transition: border-color .15s;
+    }
+    textarea:focus { outline: none; border-color: var(--accent); }
+
+    .rejection-field {
+      margin-top: 16px;
+    }
+    .rejection-input {
+      width: 100%;
+      padding: 9px 12px;
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      transition: border-color .15s;
+    }
+    .rejection-input:focus { outline: none; border-color: var(--err); }
+
+    /* ── Action buttons ── */
+    .actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 20px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 10px 18px;
+      border-radius: 8px;
+      border: 0;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 14px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: opacity .15s, transform .1s;
+    }
+    button:active { transform: scale(.97); }
+    .btn-save { background: #1e2231; color: var(--fg); border: 1px solid var(--border); }
+    .btn-approve { background: var(--ok); color: #042313; flex: 1; justify-content: center; }
+    .btn-reject { background: var(--err); color: #2b0308; }
+
+    /* ── Status message ── */
+    .msg {
+      margin-top: 14px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      display: none;
+    }
+
+    /* ── Divider ── */
+    .divider {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 16px 0;
+    }
+
+    /* ── Tablet: narrower two-column ── */
+    @media (max-width: 900px) {
+      .wrap {
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+        padding: 14px;
+      }
+      video { aspect-ratio: 9/16; max-height: 55vw; object-fit: contain; }
+    }
+
+    /* ── Mobile: single column ── */
+    @media (max-width: 600px) {
+      .header { padding: 12px 16px; }
+      .wrap {
+        grid-template-columns: 1fr;
+        gap: 12px;
+        padding: 12px;
+      }
+      video { aspect-ratio: 9/16; max-height: 70vw; object-fit: contain; }
+      .panel { padding: 16px; }
+      .btn-save { width: 100%; justify-content: center; }
+      .btn-approve { flex: unset; width: 100%; }
+      .btn-reject { width: 100%; justify-content: center; }
+      .actions { flex-direction: column; gap: 8px; }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div>
-      <video id="player" controls playsinline></video>
-      <div class="panel" style="margin-top:12px">
-        <h1 id="title">Loading…</h1>
-        <div class="meta" id="meta"></div>
-        <div id="vision" style="font-size:12px; color:var(--muted); white-space:pre-wrap"></div>
-      </div>
-    </div>
-    <div class="panel">
-      <label>Instagram</label>
-      <textarea id="ig"></textarea>
-      <label>YouTube Shorts</label>
-      <textarea id="yt"></textarea>
-      <label>TikTok</label>
-      <textarea id="tt"></textarea>
-      <label>Rejection reason (optional)</label>
-      <input id="reason" style="width:100%;padding:8px;background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:8px;" />
 
-      <div style="margin-top:18px">
-        <button class="save" id="saveBtn">Save edits</button>
-        <button class="approve" id="approveBtn">✅ Approve + post</button>
-        <button class="reject" id="rejectBtn">❌ Reject</button>
+  <header class="header">
+    <div class="header-logo">Clip<span>Factory</span></div>
+    <div class="header-badge">Reviewer</div>
+  </header>
+
+  <div class="wrap">
+
+    <!-- Left: video + clip info -->
+    <div class="left-col">
+      <video id="player" controls playsinline></video>
+      <div class="clip-info">
+        <h1 id="title">Loading…</h1>
+        <div class="clip-meta" id="meta"></div>
       </div>
-      <div id="msg" class="msg" style="display:none"></div>
     </div>
+
+    <!-- Right: captions + actions -->
+    <div class="panel">
+      <p class="panel-title">Edit captions</p>
+
+      <label>Instagram</label>
+      <textarea id="ig" placeholder="Instagram caption…"></textarea>
+
+      <label>YouTube Shorts</label>
+      <textarea id="yt" placeholder="YouTube Shorts caption…"></textarea>
+
+      <label>TikTok</label>
+      <textarea id="tt" placeholder="TikTok caption…"></textarea>
+
+      <hr class="divider" />
+
+      <div class="rejection-field">
+        <label>Rejection reason (optional)</label>
+        <input id="reason" class="rejection-input" placeholder="Reason for rejection…" />
+      </div>
+
+      <div class="actions">
+        <button class="btn-save" id="saveBtn">Save edits</button>
+        <button class="btn-approve" id="approveBtn">✅ Approve + post</button>
+        <button class="btn-reject" id="rejectBtn">❌ Reject</button>
+      </div>
+
+      <div id="msg" class="msg"></div>
+    </div>
+
   </div>
+
   <script>
     const API = (window.CLIPFACTORY_API ?? "").replace(/\/$/, "");
     const params = new URLSearchParams(location.search);
     const token = params.get("t") ?? "";
-    // Extract clip ID: prefer explicit ?id= param, then non-"review" path segment,
-    // then fall back to decoding it from the JWT payload (handles any URL shape).
     const clipId = (() => {
       const fromParam = params.get("id");
       if (fromParam) return fromParam;
@@ -72,10 +282,7 @@
 
     async function load() {
       try {
-        if (!clipId || !token) {
-          show("Missing review token or clip id.", true);
-          return;
-        }
+        if (!clipId || !token) { show("Missing review token or clip id.", true); return; }
         const res = await fetch(apiUrl(`/api/clips/${clipId}?t=${encodeURIComponent(token)}`));
         if (!res.ok) {
           show(res.status === 410 ? "Review link expired." : "Unauthorized or expired link.", true);
@@ -83,18 +290,16 @@
         }
         const { clip } = await res.json();
         document.getElementById("player").src = apiUrl(`/api/clips/${clipId}/video?t=${encodeURIComponent(token)}`);
-        document.getElementById("title").textContent = `Clip ${clip.id.slice(0,8)} · ${clip.status}`;
+        document.getElementById("title").textContent = `Clip ${clip.id.slice(0, 8)} · ${clip.status}`;
         document.getElementById("meta").textContent = `@${clip.triggered_by} · ${clip.triggered_at}`;
         document.getElementById("ig").value = clip.instagram_post_text ?? "";
         document.getElementById("yt").value = clip.youtube_post_text ?? "";
         document.getElementById("tt").value = clip.tiktok_post_text ?? "";
-        if (clip.vision_analysis) {
-          try { document.getElementById("vision").textContent = JSON.stringify(JSON.parse(clip.vision_analysis), null, 2); } catch {}
-        }
-      } catch (err) {
+      } catch {
         show("Failed to load clip review.", true);
       }
     }
+
     function edits() {
       return {
         instagram: document.getElementById("ig").value,
@@ -102,6 +307,7 @@
         tiktok: document.getElementById("tt").value,
       };
     }
+
     async function decide(action) {
       const body = { action, edits: edits() };
       if (action === "reject") body.reason = document.getElementById("reason").value || null;
@@ -113,6 +319,7 @@
       if (res.ok) show(action === "approve" ? "Approved — dispatching." : "Rejected.");
       else show((res.status === 410 ? "Review link expired." : "Request failed") + ` (${res.status})`, true);
     }
+
     async function save() {
       const res = await fetch(apiUrl(`/api/clips/${clipId}/decision?t=${encodeURIComponent(token)}`), {
         method: "POST",
@@ -121,12 +328,15 @@
       });
       show(res.ok ? "Saved." : "Save failed: " + res.status, !res.ok);
     }
+
     function show(text, isErr) {
       const el = document.getElementById("msg");
       el.style.display = "block";
       el.style.background = isErr ? "#3a1118" : "#113a22";
+      el.style.color = isErr ? "#ff6472" : "#27d07f";
       el.textContent = text;
     }
+
     document.getElementById("approveBtn").onclick = () => decide("approve");
     document.getElementById("rejectBtn").onclick = () => decide("reject");
     document.getElementById("saveBtn").onclick = save;

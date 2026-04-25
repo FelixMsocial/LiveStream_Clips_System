@@ -217,6 +217,29 @@ function trunc(s: string | null, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function clipLabelOrIgHook(clip: {
+  id: string;
+  label?: string | null;
+  instagram_post_text?: string | null;
+}): string {
+  const normalizedLabel = (clip.label ?? "").replace(/\s+/g, " ").trim();
+  if (normalizedLabel) return trunc(normalizedLabel, 80);
+
+  const igFirstLine = (clip.instagram_post_text ?? "").split(/\r?\n/, 1)[0] ?? "";
+  const normalizedHook = igFirstLine.replace(/\s+/g, " ").trim();
+  if (normalizedHook) return trunc(normalizedHook, 80);
+
+  return `clip ${clip.id}`;
+}
+
 async function buildFinalClipUrl(env: Env, key: string): Promise<string> {
   // Prefer a public R2 base if configured. Otherwise use a presigned URL.
   if (env.R2_PUBLIC_BASE) {
@@ -375,24 +398,36 @@ async function sweepPending(env: Env): Promise<void> {
   // Reminders: pending > 10m, reminder not yet sent.
   // Plain sent_at comparison (no datetime() wrapper) allows idx_clips_pending_sent index to be used.
   const reminders = await env.CLIP_DB.prepare(
-    `SELECT id, sent_at FROM clips
+    `SELECT id, sent_at, label, instagram_post_text FROM clips
      WHERE status = 'pending_approval'
        AND reminder_sent = 0
        AND sent_at IS NOT NULL
        AND sent_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-10 minutes')
        AND sent_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes')`,
-  ).all<{ id: string; sent_at: string }>();
+  ).all<{ id: string; sent_at: string; label: string | null; instagram_post_text: string | null }>();
   // Send Telegram notifications first, then batch all D1 writes together
   const reminderSuccessIds: Array<{ id: string; channel: string }> = [];
   for (const r of reminders.results ?? []) {
     try {
-      const reminderText = `⏰ Reminder: clip ${r.id} awaiting approval. Auto-expires in 10 min.`;
+      const token = await signJwt(
+        env.DASHBOARD_JWT_SECRET,
+        { clip_id: r.id, purpose: "review" },
+        APPROVAL_WINDOW_SECONDS,
+      );
+      const reviewUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review?id=${r.id}&t=${token}`;
+      const title = escapeHtml(clipLabelOrIgHook(r));
+      const reminderText = `⏰ Reminder: Clip "<b>${title}</b>" awaiting approval. Auto-expires in 10 min.\n<a href="${escapeHtml(reviewUrl)}">Open dashboard review</a>`;
       const result = await sendTelegramWithFallback(
         tg,
-        () => tg.sendMessage({ chat_id: env.TELEGRAM_APPROVER_CHAT_ID, text: reminderText }),
+        () => tg.sendMessage({
+          chat_id: env.TELEGRAM_APPROVER_CHAT_ID,
+          text: reminderText,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        }),
         env,
         `ClipFactory reminder — clip ${r.id}`,
-        `<p>${reminderText}</p>`,
+        `<p>⏰ Reminder: Clip "<strong>${title}</strong>" awaiting approval. Auto-expires in 10 min.</p><p><a href="${escapeHtml(reviewUrl)}">Open dashboard review</a></p>`,
       );
       if (result.ok) {
         reminderSuccessIds.push({ id: r.id, channel: result.channel });
@@ -424,11 +459,11 @@ async function sweepPending(env: Env): Promise<void> {
   // Expiries: pending > 20m.
   // Plain sent_at comparison allows idx_clips_pending_sent index to be used.
   const expired = await env.CLIP_DB.prepare(
-    `SELECT id FROM clips
+    `SELECT id, label, instagram_post_text FROM clips
      WHERE status = 'pending_approval'
        AND sent_at IS NOT NULL
        AND sent_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes')`,
-  ).all<{ id: string }>();
+  ).all<{ id: string; label: string | null; instagram_post_text: string | null }>();
   // Batch all expiry D1 writes, then send notifications
   if ((expired.results ?? []).length > 0) {
     const expiryStmts: D1PreparedStatement[] = [];
@@ -453,13 +488,19 @@ async function sweepPending(env: Env): Promise<void> {
   // Send expiry notifications after DB writes (non-critical, best-effort)
   for (const r of expired.results ?? []) {
     try {
-      const expireText = `⚠️ Clip ${r.id} expired with no approver decision.`;
+      const title = escapeHtml(clipLabelOrIgHook(r));
+      const expireText = `⚠️ Clip "<b>${title}</b>" expired with no approver decision.`;
       await sendTelegramWithFallback(
         tg,
-        () => tg.sendMessage({ chat_id: env.TELEGRAM_JORDY_CHAT_ID, text: expireText }),
+        () => tg.sendMessage({
+          chat_id: env.TELEGRAM_JORDY_CHAT_ID,
+          text: expireText,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        }),
         env,
         `ClipFactory — clip ${r.id} expired`,
-        `<p>${expireText}</p>`,
+        `<p>⚠️ Clip "<strong>${title}</strong>" expired with no approver decision.</p>`,
       );
     } catch (e) {
       console.error("expire escalate failed", r.id, e);
