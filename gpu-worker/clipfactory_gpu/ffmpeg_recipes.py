@@ -115,9 +115,8 @@ def build_cmd(
     )
     last = "framed"
 
-    # Burn-in captions. Style (font, colors, MarginV=576 ≈ 70% from top of
-    # the 1920px frame, karaoke palette) is owned by the ASS file produced
-    # by deepgram.words_to_ass — no force_style override here.
+    # Burn-in captions. Style (font=65pt, PlayRes 1080×1920, MarginV=576 = 30%
+    # from bottom, karaoke palette) is owned by the ASS from deepgram.words_to_ass.
     if subtitles_path and subtitles_path.exists() and subtitles_path.stat().st_size > 0:
         # Escape backslashes and colons for ffmpeg's filtergraph parser.
         sub_escaped = (

@@ -191,7 +191,12 @@ function buildTelegramCaption(clip: ClipRow): string {
   const triggeredAt = clip.triggered_at
     ? new Date(clip.triggered_at).toISOString().slice(11, 16) + " UTC"
     : null;
-  const duration = clip.duration_sec ? `${Math.round(clip.duration_sec)}s` : null;
+  const duration =
+    clip.trim_start_sec != null && clip.trim_end_sec != null
+      ? `${Math.round(clip.trim_end_sec - clip.trim_start_sec)}s`
+      : clip.duration_sec
+        ? `${Math.round(clip.duration_sec)}s`
+        : null;
 
   const lowFlag = clip.low_potential_flag ? `⚠️ <b>LOW CLIP POTENTIAL</b> — review carefully\n\n` : "";
 

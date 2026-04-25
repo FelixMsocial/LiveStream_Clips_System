@@ -81,7 +81,7 @@ def words_to_ass(
     max_chars: int = 32,
     max_duration: float = 2.5,
     font_name: str = "Inter Black",
-    font_size: int = 18,
+    font_size: int = 65,
     margin_v: int = 576,
 ) -> str:
     """Render an ASS subtitle file with per-word karaoke (\\k) timing.
@@ -89,6 +89,9 @@ def words_to_ass(
     Each cue is a phrase (≤max_chars / ≤max_duration). Within a cue, every
     word is wrapped in {\\k<centiseconds>} so the active word flips from
     SecondaryColour (yellow) to PrimaryColour (white) as it is spoken.
+
+    PlayResX/Y must match the output frame (1080×1920) so libass maps
+    MarginV and font sizes to the correct coordinate space.
     """
     cues = _group_cues(words, max_chars=max_chars, max_duration=max_duration)
     if not cues:
@@ -100,6 +103,8 @@ def words_to_ass(
         "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n"
         "YCbCr Matrix: TV.709\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n"
         "\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
@@ -108,7 +113,7 @@ def words_to_ass(
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_name},{font_size},"
         "&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,"
-        "1,0,0,0,100,100,0,0,1,3,0,2,40,40,"
+        "1,0,0,0,100,100,0,0,1,4,2,2,40,40,"
         f"{margin_v},1\n"
         "\n"
         "[Events]\n"
