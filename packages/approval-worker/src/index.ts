@@ -193,12 +193,28 @@ function buildTelegramCaption(clip: ClipRow): string {
     : null;
   const duration = clip.duration_sec ? `${Math.round(clip.duration_sec)}s` : null;
 
+  const lowFlag = clip.low_potential_flag ? `⚠️ <b>LOW CLIP POTENTIAL</b> — review carefully\n\n` : "";
+
   const header = [
     `🎬 <b>ClipFactory</b> — new clip ready for review`,
     `• triggered by: @${clip.triggered_by}${triggeredAt ? ` at ${triggeredAt}` : ""}`,
     duration ? `• duration: ${duration}` : "",
     clip.label ? `• label: ${clip.label}` : "",
   ].filter(Boolean).join("\n");
+
+  const scoreParts: string[] = [];
+  if (clip.substance_score != null) {
+    scoreParts.push(`Substance: <b>${clip.substance_score}</b>/100`);
+  }
+  if (clip.hook_score != null) {
+    const iter = clip.hook_iterations ? ` (iter ${clip.hook_iterations})` : "";
+    scoreParts.push(`Hook: <b>${clip.hook_score}</b>/100${iter}`);
+  }
+  const scoreLine = scoreParts.length ? `📊 ${scoreParts.join("  •  ")}` : "";
+
+  const hookLine = clip.hook_overlay_text
+    ? `🎯 <b>On-video hook:</b> ${escapeHtml(trunc(clip.hook_overlay_text, 120))}`
+    : "";
 
   const posts = [
     `📱 <b>Suggested posts:</b>`,
@@ -208,7 +224,10 @@ function buildTelegramCaption(clip: ClipRow): string {
     `<b>TikTok:</b> ${trunc(clip.tiktok_post_text, 200)}`,
   ].join("\n");
 
-  return `${header}\n\n${posts}\n\n⏱ Auto-expires in 20 min.`;
+  const middle = [scoreLine, hookLine].filter(Boolean).join("\n");
+  const middleBlock = middle ? `\n\n${middle}` : "";
+
+  return `${lowFlag}${header}${middleBlock}\n\n${posts}\n\n⏱ Auto-expires in 20 min.`;
 }
 
 
@@ -639,6 +658,18 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
       "tiktok_post_text",
       "gpu_timings_ms",
       "duration_sec",
+      // v1.1 substance + hook scoring
+      "substance_score",
+      "substance_score_json",
+      "low_potential_flag",
+      "peak_timestamp_sec",
+      "trim_start_sec",
+      "trim_end_sec",
+      "hook_overlay_text",
+      "hook_score",
+      "hook_score_json",
+      "hook_iterations",
+      "caption_scores_json",
     ]);
     const entries = Object.entries(patch).filter(([k]) => allowed.has(k));
     if (entries.length === 0) return Response.json({ ok: true });

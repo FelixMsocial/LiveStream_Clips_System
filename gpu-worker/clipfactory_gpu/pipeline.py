@@ -1,6 +1,13 @@
-"""End-to-end per-clip pipeline.
+"""End-to-end per-clip pipeline (v1.1).
 
-Each stage writes its timing + outputs to D1 via the approval-worker API so a
+Stage order:
+  download → transcribe (full 90s) → Step 1 substance score (Gemini) →
+  Step 2/3 hook generate-and-score iteration loop (Claude) →
+  ffmpeg edit (trim + reframe + word captions + hook overlay + sponsor) →
+  Step 4 per-platform captions (Claude single call) →
+  upload final → trigger Telegram approval
+
+Each stage writes its outputs back to D1 via the approval-worker API so a
 crash mid-pipe leaves a resumable checkpoint.
 """
 from __future__ import annotations
@@ -16,9 +23,11 @@ from .claude_copy import run_copy
 from .config import Config
 from .d1_api import D1Api
 from .deepgram import transcribe_safe, words_to_ass
-from .ffmpeg_recipes import SponsorConfig, build_cmd, run
-from .gemini import analyze_with_fallback
+from .ffmpeg_recipes import SponsorConfig, build_cmd, build_hook_overlay_ass, run
+from .hook_generator import generate as hook_generate
+from .hook_scorer import score as hook_score
 from .r2_client import R2Client
+from .substance_scorer import score_with_fallback as substance_score
 
 log = logging.getLogger(__name__)
 
@@ -26,12 +35,7 @@ log = logging.getLogger(__name__)
 def _extract_audio_for_asr(
     ffmpeg_bin: str, src: Path, dst: Path, start: float, end: float
 ) -> None:
-    """Trim audio precisely to the analysis window for transcription.
-
-    Uses accurate seek + AAC re-encode so the output begins exactly at
-    `start`; this guarantees Deepgram's word timestamps line up with the
-    final composite, which trims the same window from the same source.
-    """
+    """Extract audio from `src[start:end]` re-encoded to AAC for Deepgram."""
     import subprocess
 
     duration = max(1.0, end - start)
@@ -56,7 +60,6 @@ def _extract_audio_for_asr(
 def _probe_duration(ffmpeg_bin: str, path: Path) -> float:
     import subprocess
 
-    # ffprobe is bundled with ffmpeg; swap the binary name if needed.
     probe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
     cmd = [
         probe_bin, "-v", "error",
@@ -68,7 +71,92 @@ def _probe_duration(ffmpeg_bin: str, path: Path) -> float:
     try:
         return float(out.stdout.strip())
     except Exception:
-        return 30.0  # safe default
+        return 90.0
+
+
+def _full_transcript_text(words: list[dict[str, Any]]) -> str:
+    """Flatten full-window word list into plain text for Step 1's input."""
+    return " ".join(
+        (w.get("punctuated_word") or w.get("word") or "").strip()
+        for w in words
+        if (w.get("punctuated_word") or w.get("word"))
+    ).strip()
+
+
+def _rebase_words_to_trim(
+    words: list[dict[str, Any]], trim_start: float, trim_end: float
+) -> list[dict[str, Any]]:
+    """Filter words inside [trim_start, trim_end] and rebase timestamps to 0-based."""
+    out: list[dict[str, Any]] = []
+    for w in words:
+        ws = float(w.get("start", 0.0))
+        we = float(w.get("end", ws))
+        if we <= trim_start or ws >= trim_end:
+            continue
+        rebased = dict(w)
+        rebased["start"] = max(0.0, ws - trim_start)
+        rebased["end"] = max(rebased["start"] + 0.05, we - trim_start)
+        out.append(rebased)
+    return out
+
+
+def _run_hook_loop(
+    cfg: Config,
+    prompts: dict[str, str],
+    substance: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Iterate generate→score until PASS or HOOK_MAX_ITERATIONS hit.
+
+    Returns (final hook_output, final scorer_output, iteration_count).
+    On iteration cap, ships best-effort regardless of score.
+    """
+    last_gen: dict[str, Any] = {}
+    last_score: dict[str, Any] = {}
+    feedback: list[dict[str, Any]] | None = None
+
+    for iteration in range(1, cfg.hook_max_iterations + 1):
+        try:
+            last_gen = hook_generate(
+                cfg.anthropic_api_key,
+                prompts["hook_overlay_generator"],
+                substance,
+                iteration=iteration,
+                previous_feedback=feedback,
+                model=cfg.claude_model,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("hook generator failed on iter %d: %s", iteration, e)
+            if not last_gen:
+                last_gen = {
+                    "hook_text": substance.get("_extracted", {}).get("extractable_element") or "",
+                    "primary_archetype": "curiosity_gap",
+                    "_error": str(e),
+                }
+            break
+
+        try:
+            last_score = hook_score(
+                cfg.anthropic_api_key,
+                prompts["hook_overlay_scorer"],
+                last_gen,
+                substance,
+                iteration=iteration,
+                previous_feedback=feedback,
+                model=cfg.claude_model,
+                pass_threshold=cfg.hook_pass_threshold,
+                alignment_floor=cfg.hook_alignment_floor,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("hook scorer failed on iter %d: %s", iteration, e)
+            last_score = {"verdict": "FAIL", "_error": str(e), "weighted_total": 0}
+            break
+
+        if last_score.get("verdict") == "PASS":
+            return last_gen, last_score, iteration
+
+        feedback = last_score.get("improvement_feedback") or None
+
+    return last_gen, last_score, cfg.hook_max_iterations
 
 
 def run_pipeline(
@@ -81,7 +169,6 @@ def run_pipeline(
     raw_clip_r2_key: str,
     stream_session_id: str | None,
 ) -> None:
-    """Run the whole GPU pipeline for a single clip."""
     timings: dict[str, int] = {}
     work = Path(cfg.work_dir) / clip_id
     work.mkdir(parents=True, exist_ok=True)
@@ -90,7 +177,8 @@ def run_pipeline(
     final_path = work / "final.mp4"
     srt_path = work / "captions.srt"
     ass_path = work / "captions.ass"
-    asr_audio_path = work / "trimmed_for_asr.m4a"
+    hook_ass_path = work / "hook.ass"
+    full_audio_path = work / "full_audio.m4a"
 
     try:
         # 1. Download raw.
@@ -98,17 +186,11 @@ def run_pipeline(
         try:
             r2.download(raw_clip_r2_key, raw_path)
         except Exception as e:
-            # If object missing (common after manual bucket wipes), skip job cleanly
             if "404" in str(e) or "Not Found" in str(e):
                 log.warning("raw clip missing in R2, skipping: %s (%s)", raw_clip_r2_key, clip_id)
                 _alert_issue(
-                    d1,
-                    clip_id=clip_id,
-                    alert_type="raw_clip_missing",
-                    message=(
-                        f"Raw clip object was missing in R2. "
-                        f"raw_key={raw_clip_r2_key}"
-                    ),
+                    d1, clip_id=clip_id, alert_type="raw_clip_missing",
+                    message=f"Raw clip object was missing in R2. raw_key={raw_clip_r2_key}",
                 )
                 d1.patch_clip(
                     clip_id,
@@ -120,60 +202,108 @@ def run_pipeline(
         duration_sec = _probe_duration(cfg.ffmpeg_bin, raw_path)
         d1.patch_clip(clip_id, {"status": "analyzing", "duration_sec": duration_sec})
 
-        # 2. Gemini analysis.
+        # 2. Transcribe FULL window — Step 1 needs full transcript context;
+        #    word-level timestamps will be filtered + rebased for ASS later.
         t0 = time.monotonic()
-        vision, gemini_err = analyze_with_fallback(
-            cfg.gemini_api_key, raw_path, prompts["gemini_analysis"], duration_sec
-        )
-        timings["vision"] = _ms_since(t0)
-        if gemini_err:
-            _alert_issue(
-                d1,
-                clip_id=clip_id,
-                alert_type="gemini_api_failure",
-                message=(
-                    "Gemini analysis failed after 3 attempts; "
-                    f"using degraded midpoint trim fallback. Error: {gemini_err}"
-                ),
-            )
-        d1.patch_clip(
-            clip_id,
-            {"vision_analysis": json.dumps(vision, ensure_ascii=False)},
-        )
-
-        # 3. Deepgram transcription — run on the trim window so SRT/ASS
-        # timestamps are relative to the final cut (no drift from the trim
-        # offset). We extract audio-only with an accurate seek for ASR.
-        trim = vision["recommended_trim"]
-        trim_start = float(trim["start_sec"])
-        trim_end = float(trim["end_sec"])
-        t0 = time.monotonic()
-        _extract_audio_for_asr(
-            cfg.ffmpeg_bin, raw_path, asr_audio_path, trim_start, trim_end
-        )
-        srt_text, words, deepgram_err = transcribe_safe(
-            cfg.deepgram_api_key, asr_audio_path, content_type="audio/mp4"
+        _extract_audio_for_asr(cfg.ffmpeg_bin, raw_path, full_audio_path, 0.0, duration_sec)
+        full_srt, full_words, deepgram_err = transcribe_safe(
+            cfg.deepgram_api_key, full_audio_path, content_type="audio/mp4"
         )
         timings["transcribe"] = _ms_since(t0)
         if deepgram_err:
             _alert_issue(
-                d1,
-                clip_id=clip_id,
-                alert_type="deepgram_api_failure",
+                d1, clip_id=clip_id, alert_type="deepgram_api_failure",
                 message=(
                     "Deepgram transcription failed after 3 attempts; "
                     f"continuing without captions. Error: {deepgram_err}"
                 ),
             )
-        if srt_text:
-            srt_path.write_text(srt_text, encoding="utf-8")
-            d1.patch_clip(clip_id, {"transcript_srt": srt_text})
-        if words:
-            ass_text = words_to_ass(words)
+        full_text = _full_transcript_text(full_words)
+
+        # 3. Step 1 — Substance Scorer (Gemini, native video).
+        t0 = time.monotonic()
+        substance, gemini_err = substance_score(
+            cfg.gemini_api_key,
+            raw_path,
+            prompts["clip_substance_scorer"],
+            duration_sec,
+            model=cfg.gemini_model,
+            transcript_excerpt=full_text,
+        )
+        timings["substance_score"] = _ms_since(t0)
+        if gemini_err:
+            _alert_issue(
+                d1, clip_id=clip_id, alert_type="substance_scorer_failure",
+                message=(
+                    "Substance scorer failed after 3 attempts; using degraded fallback. "
+                    f"Error: {gemini_err}"
+                ),
+            )
+
+        weighted_total = int(substance.get("weighted_total", 0) or 0)
+        low_flag = 1 if weighted_total < cfg.substance_low_threshold else 0
+        trim = substance["recommended_trim_window"]
+        trim_start = float(trim["start_seconds"])
+        trim_end = float(trim["end_seconds"])
+        peak_ts = float(
+            substance.get("_extracted", {}).get("peak_timestamp_seconds")
+            or (trim_start + trim_end) / 2.0
+        )
+
+        d1.patch_clip(
+            clip_id,
+            {
+                "vision_analysis": json.dumps(substance, ensure_ascii=False),
+                "substance_score": weighted_total,
+                "substance_score_json": json.dumps(substance, ensure_ascii=False),
+                "low_potential_flag": low_flag,
+                "peak_timestamp_sec": peak_ts,
+                "trim_start_sec": trim_start,
+                "trim_end_sec": trim_end,
+            },
+        )
+
+        # 4. Persist trim-relative SRT + word-level ASS for the burn-in pass.
+        trim_words = _rebase_words_to_trim(full_words, trim_start, trim_end)
+        if trim_words:
+            from .deepgram import _words_to_srt  # internal helper, fine here
+            trim_srt = _words_to_srt(trim_words)
+            if trim_srt:
+                srt_path.write_text(trim_srt, encoding="utf-8")
+                d1.patch_clip(clip_id, {"transcript_srt": trim_srt})
+            ass_text = words_to_ass(trim_words)
             if ass_text:
                 ass_path.write_text(ass_text, encoding="utf-8")
 
-        # 4. FFmpeg edit.
+        # 5. Steps 2 & 3 — Hook generate ↔ score iteration loop.
+        t0 = time.monotonic()
+        hook_out, hook_eval, iter_count = _run_hook_loop(cfg, prompts, substance)
+        timings["hook_loop"] = _ms_since(t0)
+        hook_text = (hook_out.get("hook_text") or "").strip()
+        # Drop generator flag-back strings and error messages — these must not be burned in.
+        _HOOK_NON_CONTENT = (
+            "cannot generate hook",
+            "system error",
+            "no resolvable uncertainty",
+        )
+        if any(s in hook_text.lower() for s in _HOOK_NON_CONTENT):
+            log.warning("hook_text looks like a generator flag-back, suppressing burn-in: %r", hook_text)
+            hook_text = ""
+        if hook_text:
+            ass = build_hook_overlay_ass(hook_text)
+            if ass:
+                hook_ass_path.write_text(ass, encoding="utf-8")
+        d1.patch_clip(
+            clip_id,
+            {
+                "hook_overlay_text": hook_text,
+                "hook_score": int(hook_eval.get("weighted_total") or 0),
+                "hook_score_json": json.dumps(hook_eval, ensure_ascii=False),
+                "hook_iterations": iter_count,
+            },
+        )
+
+        # 6. FFmpeg edit (trim + reframe + word captions + hook overlay + sponsor).
         d1.patch_clip(clip_id, {"status": "editing"})
         sponsor = _load_sponsor(stream_session_id, work, r2) if stream_session_id else None
         cmd = build_cmd(
@@ -184,79 +314,70 @@ def run_pipeline(
             trim_end=trim_end,
             subtitles_path=ass_path if ass_path.exists() else None,
             sponsor=sponsor,
+            hook_overlay_path=hook_ass_path if hook_ass_path.exists() else None,
         )
         t0 = time.monotonic()
         try:
             _run_with_retries("ffmpeg", 3, lambda: run(cmd))
         except Exception as e:  # noqa: BLE001
             _alert_issue(
-                d1,
-                clip_id=clip_id,
-                alert_type="ffmpeg_failure",
+                d1, clip_id=clip_id, alert_type="ffmpeg_failure",
                 message=f"FFmpeg composition failed after 3 attempts. Error: {e}",
             )
             raise
         timings["ffmpeg"] = _ms_since(t0)
 
-        # 5. Upload final.
+        # 7. Upload final.
         final_key = f"final/{clip_id}.mp4"
         t0 = time.monotonic()
         try:
             _run_with_retries("r2_upload", 3, lambda: r2.upload(final_path, final_key))
         except Exception as e:  # noqa: BLE001
             _alert_issue(
-                d1,
-                clip_id=clip_id,
-                alert_type="r2_upload_failure",
+                d1, clip_id=clip_id, alert_type="r2_upload_failure",
                 message=f"Final video upload to R2 failed after 3 attempts. Error: {e}",
             )
             raise
         timings["upload"] = _ms_since(t0)
         d1.patch_clip(clip_id, {"final_clip_r2_key": final_key})
 
-        # 6. Claude copy × 3.
+        # 8. Step 4 — Per-platform captions (single Claude call).
         t0 = time.monotonic()
-        copy_out, claude_failures = run_copy(
+        captions, caption_full, copy_err = run_copy(
             cfg.anthropic_api_key,
-            prompts,
-            vision,
-            _first_quotes(vision),
-            str(vision.get("vibe", "unknown")),
+            prompts["per_platform_post_text"],
+            substance,
+            hook_out,
+            model=cfg.claude_model,
         )
         timings["copy"] = _ms_since(t0)
-        if claude_failures:
-            detail = "; ".join(
-                f"{platform}={err}" for platform, err in claude_failures.items()
-            )
+        if copy_err:
             _alert_issue(
-                d1,
-                clip_id=clip_id,
-                alert_type="claude_copy_failure",
+                d1, clip_id=clip_id, alert_type="claude_copy_failure",
                 message=(
-                    "Claude copy generation failed after 3 attempts for one or more "
-                    f"platforms; fallback text used. Details: {detail}"
+                    "Per-platform caption generation failed; fallback text used. "
+                    f"Error: {copy_err}"
                 ),
             )
 
         d1.patch_clip(
             clip_id,
             {
-                "instagram_post_text": copy_out.get("instagram", ""),
-                "youtube_post_text": copy_out.get("youtube", ""),
-                "tiktok_post_text": copy_out.get("tiktok", ""),
+                "instagram_post_text": captions.get("instagram", ""),
+                "youtube_post_text": captions.get("youtube", ""),
+                "tiktok_post_text": captions.get("tiktok", ""),
+                "caption_scores_json": json.dumps(caption_full, ensure_ascii=False),
                 "gpu_timings_ms": json.dumps(timings),
                 "status": "pending_approval",
             },
         )
 
-        # 7. Trigger approval send.
+        # 9. Trigger approval send.
         try:
             d1.trigger_approval_send(clip_id)
         except Exception as e:  # noqa: BLE001
             _alert_issue(
-                d1,
-                clip_id=clip_id,
-                alert_type="approval_send_failure",
+                d1, clip_id=clip_id, alert_type="approval_send_failure",
                 message=(
                     "Final clip rendered and uploaded, but approval notification "
                     f"failed after 3 attempts. Error: {e}"
@@ -267,24 +388,18 @@ def run_pipeline(
     except Exception as e:
         log.exception("pipeline failed for %s: %s", clip_id, e)
         _alert_issue(
-            d1,
-            clip_id=clip_id,
-            alert_type="gpu_pipeline_failure",
+            d1, clip_id=clip_id, alert_type="gpu_pipeline_failure",
             message=f"GPU pipeline failed during editing flow. Error: {e}",
         )
         try:
             d1.patch_clip(
                 clip_id,
-                {
-                    "status": "failed_edit",
-                    "gpu_timings_ms": json.dumps(timings),
-                },
+                {"status": "failed_edit", "gpu_timings_ms": json.dumps(timings)},
             )
         except Exception:
             log.exception("failed to mark failed_edit")
         raise
     finally:
-        # Cleanup workdir on success only — leave it for debugging on error.
         if final_path.exists():
             shutil.rmtree(work, ignore_errors=True)
 
@@ -292,9 +407,6 @@ def run_pipeline(
 def _load_sponsor(
     session_id: str, work: Path, r2: R2Client
 ) -> SponsorConfig | None:
-    # V1: if sponsor asset exists at sponsors/{session_id}.*, pull it.
-    # For video formats we assume a green-screen logo and pre-process with
-    # chroma-key before placing in the output.
     for ext in ("mp4", "mov", "png", "webp"):
         key = f"sponsors/{session_id}.{ext}"
         head = r2.head(key)
@@ -311,12 +423,6 @@ def _load_sponsor(
                 opacity=0.95 if is_video else 0.85,
             )
     return None
-
-
-def _first_quotes(vision: dict[str, Any]) -> str:
-    quotes = vision.get("quotes") or []
-    joined = " ".join(str(q.get("text", "")) for q in quotes[:4])
-    return joined.strip()
 
 
 def _ms_since(t0: float) -> int:
@@ -345,8 +451,4 @@ def _alert_issue(
     alert_type: str,
     message: str,
 ) -> None:
-    d1.send_alert(
-        clip_id=clip_id,
-        alert_type=alert_type,
-        message=message,
-    )
+    d1.send_alert(clip_id=clip_id, alert_type=alert_type, message=message)

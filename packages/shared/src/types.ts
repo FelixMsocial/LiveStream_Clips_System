@@ -60,10 +60,60 @@ export interface VisionAnalysis {
   degraded?: boolean;
 }
 
+// v1.1 Substance Scorer output (Step 1, Gemini). Stored as JSON in
+// substance_score_json. The shape is intentionally permissive — the schema
+// is enforced server-side by the prompt + Python validator.
+export interface SubstanceScore {
+  rule_scores: Record<string, { score: number; reasoning: string; [k: string]: unknown }>;
+  coherence_bonus: { score: number; reasoning: string };
+  weighted_total: number;
+  interpretation: "viral_candidate" | "solid" | "mid_tier" | "weak" | "very_weak";
+  primary_strength: string;
+  primary_weakness: string;
+  context_summary: string;
+  recommended_trim_window: {
+    start_seconds: number;
+    end_seconds: number;
+    rationale: string;
+  };
+  rulebook_version: string;
+  _extracted?: {
+    peak_timestamp_seconds: number;
+    peak_emotion: string;
+    extractable_element: string;
+    trigger_type: string;
+  };
+  degraded?: boolean;
+}
+
+export interface HookScore {
+  verdict: "PASS" | "FAIL";
+  weighted_total: number;
+  rule_scores: Record<string, { score: number; reasoning: string; [k: string]: unknown }>;
+  coherence_bonus: { score: number; reasoning: string };
+  interpretation: string;
+  primary_strength: string;
+  primary_weakness: string;
+  improvement_feedback: Array<{
+    rule_number: number;
+    rule_name: string;
+    current_score: number;
+    what_is_wrong: string;
+    why_it_fails: string;
+    what_to_change: string;
+  }>;
+  minor_concerns: string[];
+  iteration_number: number;
+  addressed_previous_feedback: "true" | "false" | "partial" | null;
+  rulebook_version: string;
+}
+
 export interface GpuTimingsMs {
   download?: number;
   vision?: number;
   transcribe?: number;
+  substance_score?: number;
+  hook_loop?: number;
   ffmpeg?: number;
   upload?: number;
   copy?: number;
@@ -87,6 +137,18 @@ export interface ClipRow {
   instagram_post_text: string | null;
   youtube_post_text: string | null;
   tiktok_post_text: string | null;
+  // v1.1 substance + hook scoring (added in migration 0006)
+  substance_score: number | null;
+  substance_score_json: string | null;
+  low_potential_flag: number;
+  peak_timestamp_sec: number | null;
+  trim_start_sec: number | null;
+  trim_end_sec: number | null;
+  hook_overlay_text: string | null;
+  hook_score: number | null;
+  hook_score_json: string | null;
+  hook_iterations: number;
+  caption_scores_json: string | null;
   approver_decision: string | null;
   approver_reason: string | null;
   approver_edits: string | null;

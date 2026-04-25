@@ -90,6 +90,55 @@
       color: var(--muted);
     }
 
+    /* ── Scores card (v1.1) ── */
+    .scores-card {
+      background: var(--panel);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .scores-card .panel-title {
+      margin: 0 0 10px;
+    }
+    .score-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .score-row:last-of-type { border-bottom: 0; }
+    .score-label { color: var(--muted); font-size: 12px; }
+    .score-value { font-weight: 700; font-size: 14px; }
+    .score-value.bad { color: var(--err); }
+    .score-value.mid { color: #f0b042; }
+    .score-value.good { color: var(--ok); }
+    .low-warn {
+      background: #3a1118;
+      color: var(--err);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .hook-text {
+      margin-top: 8px;
+      padding: 8px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 13px;
+      font-style: italic;
+      color: var(--fg);
+    }
+    .hook-text-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-bottom: 4px;
+    }
+
     /* ── Right panel ── */
     .panel {
       background: var(--panel);
@@ -228,6 +277,26 @@
         <h1 id="title">Loading…</h1>
         <div class="clip-meta" id="meta"></div>
       </div>
+      <div class="scores-card" id="scoresCard" style="display:none">
+        <p class="panel-title">AI scores</p>
+        <div id="lowWarn" class="low-warn" style="display:none">⚠️ LOW CLIP POTENTIAL — review carefully</div>
+        <div class="score-row">
+          <span class="score-label">Substance score</span>
+          <span class="score-value" id="substanceScore">—</span>
+        </div>
+        <div class="score-row">
+          <span class="score-label">Hook score (iter <span id="hookIter">—</span>)</span>
+          <span class="score-value" id="hookScore">—</span>
+        </div>
+        <div class="score-row">
+          <span class="score-label">Trim window</span>
+          <span class="score-value" id="trimWindow">—</span>
+        </div>
+        <div id="hookTextBlock" style="display:none">
+          <div class="hook-text-label">On-video hook</div>
+          <div class="hook-text" id="hookText"></div>
+        </div>
+      </div>
     </div>
 
     <!-- Right: captions + actions -->
@@ -295,8 +364,53 @@
         document.getElementById("ig").value = clip.instagram_post_text ?? "";
         document.getElementById("yt").value = clip.youtube_post_text ?? "";
         document.getElementById("tt").value = clip.tiktok_post_text ?? "";
+        renderScores(clip);
       } catch {
         show("Failed to load clip review.", true);
+      }
+    }
+
+    function scoreClass(v) {
+      if (v == null) return "";
+      if (v >= 65) return "good";
+      if (v >= 50) return "mid";
+      return "bad";
+    }
+
+    function renderScores(clip) {
+      const hasAny =
+        clip.substance_score != null ||
+        clip.hook_score != null ||
+        clip.hook_overlay_text;
+      if (!hasAny) return;
+      document.getElementById("scoresCard").style.display = "block";
+
+      if (clip.low_potential_flag) {
+        document.getElementById("lowWarn").style.display = "block";
+      }
+
+      const subs = document.getElementById("substanceScore");
+      if (clip.substance_score != null) {
+        subs.textContent = `${clip.substance_score}/100`;
+        subs.className = `score-value ${scoreClass(clip.substance_score)}`;
+      }
+
+      const hook = document.getElementById("hookScore");
+      if (clip.hook_score != null) {
+        hook.textContent = `${clip.hook_score}/100`;
+        hook.className = `score-value ${scoreClass(clip.hook_score)}`;
+      }
+      document.getElementById("hookIter").textContent =
+        clip.hook_iterations != null ? clip.hook_iterations : "—";
+
+      if (clip.trim_start_sec != null && clip.trim_end_sec != null) {
+        document.getElementById("trimWindow").textContent =
+          `${clip.trim_start_sec.toFixed(1)}s – ${clip.trim_end_sec.toFixed(1)}s`;
+      }
+
+      if (clip.hook_overlay_text) {
+        document.getElementById("hookTextBlock").style.display = "block";
+        document.getElementById("hookText").textContent = clip.hook_overlay_text;
       }
     }
 

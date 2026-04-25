@@ -37,6 +37,16 @@ class Config:
     ffmpeg_bin: str
     work_dir: str
 
+    # Scoring / hook iteration thresholds
+    substance_low_threshold: int      # weighted_total below this sets low_potential_flag
+    hook_pass_threshold: int          # weighted_total at/above this passes the scorer
+    hook_alignment_floor: int         # rule-5 score below this is hard-veto regardless of total
+    hook_max_iterations: int          # max generate→score loops before shipping best-effort
+
+    # Models
+    claude_model: str
+    gemini_model: str
+
 
 def load_config() -> Config:
     load_dotenv(dotenv_path=_find_env(), override=False)
@@ -74,6 +84,12 @@ def load_config() -> Config:
         gpu_internal_secret=req("GPU_INTERNAL_SECRET"),
         ffmpeg_bin=os.environ.get("FFMPEG_BIN", "ffmpeg"),
         work_dir=os.environ.get("GPU_WORK_DIR", str(Path.cwd() / "tmp")),
+        substance_low_threshold=int(os.environ.get("SUBSTANCE_LOW_THRESHOLD", "50")),
+        hook_pass_threshold=int(os.environ.get("HOOK_PASS_THRESHOLD", "65")),
+        hook_alignment_floor=int(os.environ.get("HOOK_ALIGNMENT_FLOOR", "6")),
+        hook_max_iterations=int(os.environ.get("HOOK_MAX_ITERATIONS", "3")),
+        claude_model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-pro"),
     )
 
 

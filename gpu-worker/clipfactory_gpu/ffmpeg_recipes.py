@@ -2,6 +2,8 @@
 
 9:16 reframe = blurred scaled background + centered scaled foreground.
 Captions are burned in via libass `subtitles=` filter.
+Hook overlay (the v1.1 on-video framing line) is composited as a second
+`subtitles=` pass with a top-third style and a 0-4s display window.
 Sponsor overlay (optional) is positioned bottom-right with configurable opacity.
 Video sponsor assets can optionally apply chroma-key pre-processing.
 """
@@ -14,6 +16,64 @@ from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def build_hook_overlay_ass(
+    hook_text: str,
+    *,
+    visible_until_sec: float = 4.0,
+    font_name: str = "Inter Black",
+    font_size: int = 80,
+    margin_v_top: int = 120,
+) -> str:
+    """Render an ASS file containing a single dialogue line for the hook overlay.
+
+    Top-anchored (Alignment=8 = top-center), bold, with a thick outline so it
+    reads on any background. Composes alongside the word-by-word caption ASS
+    in a separate `subtitles=` filter pass.
+    """
+    text = (hook_text or "").strip()
+    if not text:
+        return ""
+    # Hard-wrap to 2 lines if >9 words by inserting an ASS line break at the midpoint word.
+    words = text.split()
+    if len(words) > 9:
+        mid = len(words) // 2
+        text = " ".join(words[:mid]) + r"\N" + " ".join(words[mid:])
+    # ASS escape commas (style/event field separator).
+    text_safe = text.replace(",", "\\,")
+
+    end_h = int(visible_until_sec // 3600)
+    end_m = int((visible_until_sec % 3600) // 60)
+    end_s = int(visible_until_sec % 60)
+    end_cs = int(round((visible_until_sec - int(visible_until_sec)) * 100))
+    if end_cs >= 100:
+        end_cs = 99
+    end_ts = f"{end_h:d}:{end_m:02d}:{end_s:02d}.{end_cs:02d}"
+
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        "YCbCr Matrix: TV.709\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Hook,{font_name},{font_size},"
+        "&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+        "1,0,0,0,100,100,0,0,1,5,2,8,60,60,"
+        f"{margin_v_top},1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        f"Dialogue: 0,0:00:00.00,{end_ts},Hook,,0,0,0,,{text_safe}\n"
+    )
 
 
 @dataclass(frozen=True)
@@ -38,6 +98,7 @@ def build_cmd(
     trim_end: float,
     subtitles_path: Path | None,
     sponsor: SponsorConfig | None,
+    hook_overlay_path: Path | None = None,
 ) -> list[str]:
     duration = max(1.0, trim_end - trim_start)
 
@@ -66,6 +127,22 @@ def build_cmd(
             f"[{last}]subtitles='{sub_escaped}'[captioned]"
         )
         last = "captioned"
+
+    # Hook overlay (Step 2 v1.1). Burned in as a second subtitles pass so it
+    # shares libass with the word-level captions but uses its own top-anchored
+    # style and 0-4s display window.
+    if (
+        hook_overlay_path
+        and hook_overlay_path.exists()
+        and hook_overlay_path.stat().st_size > 0
+    ):
+        hook_escaped = (
+            str(hook_overlay_path).replace("\\", "/").replace(":", r"\:")
+        )
+        filter_parts.append(
+            f"[{last}]subtitles='{hook_escaped}'[hooked]"
+        )
+        last = "hooked"
 
     # Sponsor overlay.
     if sponsor is not None:
