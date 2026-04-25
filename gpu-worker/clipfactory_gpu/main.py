@@ -20,7 +20,7 @@ from .r2_client import R2Client
 log = logging.getLogger(__name__)
 
 IDLE_SLEEP_SEC = 5.0
-HEARTBEAT_INTERVAL_SEC = 30.0
+HEARTBEAT_INTERVAL_SEC = 60.0
 PROMPT_REFRESH_SEC = 300.0  # Re-fetch prompts from D1 every 5 minutes
 ALERT_COOLDOWN_SEC = 900.0
 

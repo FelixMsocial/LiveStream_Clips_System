@@ -94,9 +94,17 @@ export class ChatListenerDO {
   }
 
   private async heartbeat(): Promise<void> {
-    await this.env.CLIP_KV.put("gpu:heartbeat:listener", String(Date.now()), {
-      expirationTtl: 300,
-    });
+    await withRetry(
+      () =>
+        this.env.CLIP_DB.prepare(
+          `INSERT INTO worker_heartbeats (worker_id, last_seen_ts, meta, updated_at)
+           VALUES ('listener', ?1, NULL, datetime('now'))
+           ON CONFLICT(worker_id) DO UPDATE SET
+             last_seen_ts = excluded.last_seen_ts,
+             updated_at   = datetime('now')`,
+        ).bind(Date.now()).run(),
+      { label: "listener heartbeat upsert" },
+    );
     const stale =
       this.status.last_message_at !== null &&
       Date.now() - this.status.last_message_at > STALE_AFTER_MS;

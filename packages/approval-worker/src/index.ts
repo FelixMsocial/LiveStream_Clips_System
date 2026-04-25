@@ -23,6 +23,7 @@ const TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
 const VIDEO_ATTACH_MAX_BYTES = 49 * 1024 * 1024; // Telegram limit via bot API
 const PAGES_PROD_ORIGIN = "https://clipfactory.pages.dev";
 const APPROVAL_WINDOW_SECONDS = 20 * 60;
+const HEARTBEAT_DEAD_MS = 180_000; // 3 missed 60s beats — tolerates one transient failure
 
 export default {
   async queue(batch: MessageBatch<ApprovalSendJob>, env: Env): Promise<void> {
@@ -494,21 +495,30 @@ async function sweepPending(env: Env): Promise<void> {
 async function checkHeartbeats(env: Env): Promise<void> {
   const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
   const checks = [
-    { kvKey: "gpu:heartbeat", alertKey: "alert:gpu:sent", label: "GPU worker" },
-    { kvKey: "gpu:heartbeat:listener", alertKey: "alert:listener:sent", label: "Twitch listener" },
+    { workerId: "gpu",      alertKey: "alert:gpu:sent",      label: "GPU worker" },
+    { workerId: "listener", alertKey: "alert:listener:sent", label: "Twitch listener" },
   ];
-  for (const { kvKey, alertKey, label } of checks) {
-    const val = await env.CLIP_KV.get(kvKey);
-    if (val !== null) {
-      // Heartbeat is alive — clear any sent-alert flag so we can alert again if it dies later.
+
+  const rows = await env.CLIP_DB.prepare(
+    `SELECT worker_id, last_seen_ts FROM worker_heartbeats
+     WHERE worker_id IN ('gpu', 'listener')`,
+  ).all<{ worker_id: string; last_seen_ts: number }>();
+  const lastSeen = new Map<string, number>();
+  for (const r of rows.results ?? []) lastSeen.set(r.worker_id, r.last_seen_ts);
+
+  const now = Date.now();
+  for (const { workerId, alertKey, label } of checks) {
+    const ts = lastSeen.get(workerId);
+    const alive = ts !== undefined && (now - ts) <= HEARTBEAT_DEAD_MS;
+
+    if (alive) {
       const alertWasSent = await env.CLIP_KV.get(alertKey);
       if (alertWasSent) await env.CLIP_KV.delete(alertKey);
       continue;
     }
-    // Heartbeat missing (TTL expired = dead for 5+ min). Check if we already alerted recently.
     const alreadySent = await env.CLIP_KV.get(alertKey);
     if (alreadySent) continue; // Suppress duplicate alerts for 30 minutes.
-    const alertText = `🔴 ${label} has been unresponsive for 5+ minutes.`;
+    const alertText = `🔴 ${label} has been unresponsive for 3+ minutes.`;
     try {
       const result = await sendTelegramWithFallback(
         tg,
@@ -518,7 +528,7 @@ async function checkHeartbeats(env: Env): Promise<void> {
         `<p>${alertText}</p>`,
       );
       if (result.ok) {
-        await env.CLIP_KV.put(alertKey, String(Date.now()), { expirationTtl: 1800 }); // 30 min suppression
+        await env.CLIP_KV.put(alertKey, String(now), { expirationTtl: 1800 }); // 30 min suppression
       } else {
         console.error(`heartbeat alert delivery failed for ${label} via all channels`);
       }
@@ -537,11 +547,15 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     const body = await req
       .json<{ worker_id?: string }>()
       .catch(() => ({}) as { worker_id?: string });
-    await env.CLIP_KV.put(
-      "gpu:heartbeat",
-      JSON.stringify({ at: Date.now(), worker_id: body.worker_id ?? "unknown" }),
-      { expirationTtl: 300 },
-    );
+    const meta = JSON.stringify({ worker_id: body.worker_id ?? "unknown" });
+    await env.CLIP_DB.prepare(
+      `INSERT INTO worker_heartbeats (worker_id, last_seen_ts, meta, updated_at)
+       VALUES ('gpu', ?1, ?2, datetime('now'))
+       ON CONFLICT(worker_id) DO UPDATE SET
+         last_seen_ts = excluded.last_seen_ts,
+         meta         = excluded.meta,
+         updated_at   = datetime('now')`,
+    ).bind(Date.now(), meta).run();
     return Response.json({ ok: true });
   }
 
