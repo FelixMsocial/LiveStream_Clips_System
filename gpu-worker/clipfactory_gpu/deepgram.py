@@ -80,9 +80,10 @@ def words_to_ass(
     *,
     max_chars: int = 32,
     max_duration: float = 2.5,
-    font_name: str = "Inter Black",
+    font_name: str = "Poppins SemiBold",
     font_size: int = 65,
     margin_v: int = 576,
+    outline: int = 6,
 ) -> str:
     """Render an ASS subtitle file with per-word karaoke (\\k) timing.
 
@@ -113,7 +114,7 @@ def words_to_ass(
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_name},{font_size},"
         "&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,"
-        "1,0,0,0,100,100,0,0,1,4,2,2,40,40,"
+        f"0,0,0,0,100,100,0,0,1,{outline},0,2,40,40,"
         f"{margin_v},1\n"
         "\n"
         "[Events]\n"

@@ -25,6 +25,21 @@ def _default_font_path() -> str:
     return "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
 
+def _default_emoji_font_path() -> str:
+    """Best-effort color-emoji font for the current platform (empty if none)."""
+    if sys.platform == "win32":
+        win = Path(r"C:\Windows\Fonts\seguiemj.ttf")
+        return str(win) if win.exists() else ""
+    candidates = [
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/truetype/twemoji/TwitterColorEmoji-SVGinOT.ttf",
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            return p
+    return ""
+
+
 @dataclass(frozen=True)
 class Config:
     # Cloudflare Queues pull
@@ -53,7 +68,8 @@ class Config:
     # FFmpeg
     ffmpeg_bin: str
     work_dir: str
-    hook_font_path: str   # absolute path to a bold sans-serif TTF on the GPU machine
+    hook_font_path: str        # absolute path to a bold sans-serif TTF on the GPU machine
+    hook_emoji_font_path: str  # absolute path to a color emoji TTF (empty disables emoji)
 
     # Scoring / hook iteration thresholds
     substance_low_threshold: int      # weighted_total below this sets low_potential_flag
@@ -105,6 +121,12 @@ def load_config() -> Config:
         # Override with HOOK_FONT_PATH in .env to use any TTF on the GPU machine.
         # Defaults to Arial Bold on Windows, Liberation Sans Bold on Linux.
         hook_font_path=os.environ.get("HOOK_FONT_PATH", _default_font_path()),
+        # Color emoji font for the hook overlay. Defaults to Segoe UI Emoji on
+        # Windows, Noto Color Emoji on Linux. Set HOOK_EMOJI_FONT_PATH="" to
+        # disable emoji rendering.
+        hook_emoji_font_path=os.environ.get(
+            "HOOK_EMOJI_FONT_PATH", _default_emoji_font_path()
+        ),
         substance_low_threshold=int(os.environ.get("SUBSTANCE_LOW_THRESHOLD", "50")),
         hook_pass_threshold=int(os.environ.get("HOOK_PASS_THRESHOLD", "65")),
         hook_alignment_floor=int(os.environ.get("HOOK_ALIGNMENT_FLOOR", "6")),

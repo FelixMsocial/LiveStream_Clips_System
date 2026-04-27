@@ -311,6 +311,7 @@ def run_pipeline(
             sponsor=sponsor,
             hook_text=hook_text or None,
             hook_font_path=cfg.hook_font_path if hook_text else None,
+            hook_emoji_font_path=cfg.hook_emoji_font_path if hook_text else None,
         )
         t0 = time.monotonic()
         try:

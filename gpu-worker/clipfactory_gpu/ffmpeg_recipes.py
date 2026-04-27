@@ -2,10 +2,11 @@
 
 9:16 reframe = blurred scaled background + centered scaled foreground.
 Captions are burned in via libass `subtitles=` filter.
-Hook overlay uses FFmpeg drawtext: white box (box=1, boxcolor=white@0.9,
-boxborderw=25), black bold text, centered, full clip duration.
-Sponsor overlay (optional) is positioned bottom-right with configurable opacity.
-Video sponsor assets can optionally apply chroma-key pre-processing.
+Hook overlay is pre-rendered to a PNG by hook_renderer (Pillow) — rounded
+white box, black bold text, mixed Latin + color-emoji fonts — then
+composited via FFmpeg `overlay`. Sponsor overlay (optional) is positioned
+bottom-right with configurable opacity. Video sponsor assets can optionally
+apply chroma-key pre-processing.
 """
 from __future__ import annotations
 
@@ -15,79 +16,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .hook_renderer import render_hook_png
+
 log = logging.getLogger(__name__)
 
 
-def _wrap_hook_text(text: str) -> str:
-    """Split hook into 2-3 lines so drawtext doesn't overflow the frame width."""
-    words = text.split()
-    n = len(words)
-    if n <= 4:
-        return text
-    if n <= 8:
-        mid = (n + 1) // 2
-        return " ".join(words[:mid]) + "\n" + " ".join(words[mid:])
-    # 3 lines for long hooks
-    sz = (n + 2) // 3
-    return (
-        " ".join(words[:sz]) + "\n"
-        + " ".join(words[sz: 2 * sz]) + "\n"
-        + " ".join(words[2 * sz:])
-    )
-
-
-def _drawtext_hook_filter(
-    label_in: str,
-    label_out: str,
-    hook_text: str,
-    font_path: str,
-    *,
-    font_size: int = 55,
-    margin_top: int = 150,
-) -> str:
-    """Build one drawtext filtergraph segment for the hook overlay.
-
-    Produces: white box (box=1, boxcolor=white@0.9, boxborderw=25),
-    pure-black bold text, horizontally centered, top-anchored.
-    Visible for the full clip (no enable= needed since video length is the clip).
-    """
-    # FFmpeg single-quoted strings cannot contain a literal apostrophe, and
-    # backslash-escapes inside them are limited — the cleanest workaround is
-    # to swap any apostrophe for a typographic right-single-quote. Visually
-    # identical, no escaping required.
-    wrapped = _wrap_hook_text(hook_text).replace("'", "’")
-
-    # Filter-arg level-2 escaping (inside single quotes):
-    #   backslash → \\  (literal backslash)
-    #   colon     → \:  (option separator)
-    #   comma     → \,  (filterchain separator at level 1, safe to escape)
-    #   newline   → \n  (drawtext interprets the two-char sequence as newline)
-    text_esc = (
-        wrapped
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace(",", "\\,")
-        .replace("\n", "\\n")
-    )
-
-    # Normalize font path separators and escape the drive-letter colon
-    # (`C:/Windows/...` → `C\:/Windows/...`) so the filter parser doesn't
-    # treat it as an option separator.
-    font_esc = font_path.replace("\\", "/").replace(":", r"\:")
-
-    return (
-        f"[{label_in}]drawtext="
-        f"fontfile='{font_esc}':"
-        f"text='{text_esc}':"
-        f"fontcolor=black:"
-        f"fontsize={font_size}:"
-        f"x=(w-text_w)/2:"
-        f"y={margin_top}:"
-        f"box=1:"
-        f"boxcolor=white@0.9:"
-        f"boxborderw=25"
-        f"[{label_out}]"
-    )
+# Vertical position of the hook PNG from the top of the 1920px frame.
+HOOK_TOP_MARGIN = 80
 
 
 @dataclass(frozen=True)
@@ -114,10 +49,12 @@ def build_cmd(
     sponsor: SponsorConfig | None,
     hook_text: str | None = None,
     hook_font_path: str | None = None,
+    hook_emoji_font_path: str | None = None,
 ) -> list[str]:
     duration = max(1.0, trim_end - trim_start)
 
     inputs: list[str] = ["-y", "-hwaccel", "cuda", "-ss", f"{trim_start:.3f}", "-t", f"{duration:.3f}", "-i", str(input_path)]
+    next_input = 1  # 0 is the main video
 
     filter_parts: list[str] = []
     # Base 9:16 reframe — blurred bg + centered fg.
@@ -142,22 +79,14 @@ def build_cmd(
         )
         last = "captioned"
 
-    # Hook overlay — drawtext with white box background, black bold text,
-    # horizontally centered, top-anchored, visible for the full clip duration.
-    if hook_text and hook_font_path and Path(hook_font_path).exists():
-        filter_parts.append(
-            _drawtext_hook_filter(last, "hooked", hook_text, hook_font_path)
-        )
-        last = "hooked"
-    elif hook_text and hook_font_path:
-        log.warning("hook font not found at %r — skipping hook overlay", hook_font_path)
-
-    # Sponsor overlay.
+    # Sponsor overlay (input added first so we keep its existing index
+    # behavior; also lets the hook PNG sit on top in the filter chain).
     if sponsor is not None:
+        sponsor_idx = next_input
         if sponsor.is_video:
             inputs += ["-stream_loop", "-1", "-i", str(sponsor.path)]
             filter_parts.append(
-                "[1:v]"
+                f"[{sponsor_idx}:v]"
                 "scale=1000:-1,"
                 "format=rgba,"
                 f"chromakey={sponsor.chroma_color}:{sponsor.chroma_similarity}:{sponsor.chroma_blend},"
@@ -170,7 +99,7 @@ def build_cmd(
         else:
             inputs += ["-i", str(sponsor.path)]
             sw = int(1080 * sponsor.scale_pct)
-            sponsor_src = "1:v"
+            sponsor_src = f"{sponsor_idx}:v"
 
             if sponsor.remove_green:
                 prep = ["format=rgba"]
@@ -178,7 +107,7 @@ def build_cmd(
                     "chromakey="
                     f"{sponsor.chroma_color}:{sponsor.chroma_similarity}:{sponsor.chroma_blend}"
                 )
-                filter_parts.append(f"[1:v]{','.join(prep)}[spbase]")
+                filter_parts.append(f"[{sponsor_idx}:v]{','.join(prep)}[spbase]")
                 sponsor_src = "spbase"
 
             filter_parts.append(
@@ -191,8 +120,37 @@ def build_cmd(
                 "top-left": "40:40",
             }.get(sponsor.position, "W-w-40:H-h-40")
 
-        filter_parts.append(f"[{last}][sp]overlay={pos}[outv]")
-        last = "outv"
+        filter_parts.append(f"[{last}][sp]overlay={pos}[sponsored]")
+        last = "sponsored"
+        next_input += 1
+
+    # Hook overlay — Pillow renders a transparent PNG (rounded white box,
+    # black bold text, color emoji), then FFmpeg overlays it. This bypasses
+    # drawtext's escaping limits and lets us mix Latin + emoji fonts.
+    if hook_text and hook_font_path and Path(hook_font_path).exists():
+        hook_png = output_path.with_name("hook.png")
+        try:
+            rendered = render_hook_png(
+                hook_text,
+                hook_png,
+                text_font_path=hook_font_path,
+                emoji_font_path=hook_emoji_font_path or None,
+                font_size=55,
+                max_text_width=940,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("hook PNG render failed: %s — skipping hook overlay", e)
+            rendered = None
+        if rendered is not None:
+            hook_idx = next_input
+            inputs += ["-i", str(hook_png)]
+            next_input += 1
+            filter_parts.append(
+                f"[{last}][{hook_idx}:v]overlay=x=(W-w)/2:y={HOOK_TOP_MARGIN}[hooked]"
+            )
+            last = "hooked"
+    elif hook_text and hook_font_path:
+        log.warning("hook font not found at %r — skipping hook overlay", hook_font_path)
 
     filter_complex = ";".join(filter_parts)
 
