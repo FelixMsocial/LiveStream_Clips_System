@@ -1,13 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "rootDir": "src",
-    "outDir": "dist",
     "paths": {
       "@clipfactory/shared": ["../shared/src/index.ts"],
       "@clipfactory/shared/*": ["../shared/src/*"]
     }
   },
-  "include": ["src/**/*.ts"],
-  "exclude": [".wrangler", "dist", "node_modules"]
+  "include": ["src/**/*.ts"]
 }

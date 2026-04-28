@@ -151,6 +151,70 @@ export async function isApprover(
   return !!row;
 }
 
+export async function setDispatchedBrand(
+  db: D1,
+  clipId: string,
+  brand: { id: number; brand_name: string; blog_id: number },
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE clips
+       SET dispatched_brand_id = ?1,
+           dispatched_brand_name = ?2,
+           dispatched_blog_id = ?3,
+           dispatched_at = datetime('now'),
+           updated_at = datetime('now')
+       WHERE id = ?4`,
+    )
+    .bind(brand.id, brand.brand_name, brand.blog_id, clipId)
+    .run();
+}
+
+export type PostResultKind = "posted" | "posted_partial" | "post_failed";
+
+export async function setPostResult(
+  db: D1,
+  clipId: string,
+  kind: PostResultKind,
+  post_urls?: Record<string, string> | null,
+  metricool_post_ids?: Record<string, string> | null,
+  post_errors?: Record<string, string> | null,
+): Promise<void> {
+  const statusMap: Record<PostResultKind, string> = {
+    posted: "posted",
+    posted_partial: "posted_partial",
+    post_failed: "post_failed",
+  };
+  const fields = ["status = ?1", "updated_at = datetime('now')"];
+  const bindings: Array<string | number | null> = [statusMap[kind]];
+  let idx = 2;
+
+  if (kind === "posted" || kind === "posted_partial") {
+    fields.push(`posted_at = datetime('now')`);
+  }
+  if (post_urls != null) {
+    fields.push(`post_urls = ?${idx}`);
+    bindings.push(JSON.stringify(post_urls));
+    idx += 1;
+  }
+  if (metricool_post_ids != null) {
+    fields.push(`metricool_post_ids = ?${idx}`);
+    bindings.push(JSON.stringify(metricool_post_ids));
+    idx += 1;
+  }
+  if (post_errors != null) {
+    fields.push(`post_errors = ?${idx}`);
+    bindings.push(JSON.stringify(post_errors));
+    idx += 1;
+  }
+
+  bindings.push(clipId);
+  await db
+    .prepare(`UPDATE clips SET ${fields.join(", ")} WHERE id = ?${idx}`)
+    .bind(...bindings)
+    .run();
+}
+
 export async function getActiveSponsor(
   db: D1,
   sessionId: string,

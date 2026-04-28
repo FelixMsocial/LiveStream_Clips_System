@@ -5,6 +5,13 @@ export interface Env {
   N8N_WEBHOOK_URL: string;
   N8N_WEBHOOK_SECRET: string;
 
+  GPU_INTERNAL_SECRET: string;
+
+  // Service binding to approval-worker for ops alerts
+  OPS: Fetcher;
+
+  DASHBOARD_URL?: string;
+
   R2_ACCOUNT_ID: string;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;

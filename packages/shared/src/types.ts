@@ -11,6 +11,9 @@ export type ClipStatus =
   | "expired"
   | "ready_to_post"
   | "posted"
+  | "dispatched"
+  | "posted_partial"
+  | "post_failed"
   | "failed_capture"
   | "failed_edit"
   | "failed_post"
@@ -149,6 +152,14 @@ export interface ClipRow {
   hook_score_json: string | null;
   hook_iterations: number;
   caption_scores_json: string | null;
+  // dispatch columns (added in migration 0009)
+  dispatched_brand_id: number | null;
+  dispatched_brand_name: string | null;
+  dispatched_blog_id: number | null;
+  dispatched_at: string | null;
+  metricool_post_ids: string | null;
+  post_errors: string | null;
+  alert_sent_at: string | null;
   approver_decision: string | null;
   approver_reason: string | null;
   approver_edits: string | null;
@@ -179,6 +190,10 @@ export interface CaptionsTriple {
 export interface N8nPostPayload {
   clip_id: string;
   video_url: string;
+  brand: { id: number; brand_name: string; blog_id: number };
+  titles_per_platform: { youtube: string; tiktok: string; instagram: string };
+  publish_now: true;
+  // backwards-compat for one release: mirror of titles_per_platform
   captions: CaptionsTriple;
   sponsor_session_id?: string | null;
   approved_by: string;

@@ -46,6 +46,8 @@ export default {
   async scheduled(_ev: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(sweepPending(env));
     ctx.waitUntil(checkHeartbeats(env));
+    ctx.waitUntil(sweepStuckDispatched(env));
+    ctx.waitUntil(sweepReadyToPost(env));
   },
 
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -71,20 +73,125 @@ export default {
       return new Response("ok");
     }
 
-    // n8n callback: { clip_id, post_urls: {...} }
+    // n8n callback: extended body with brand, status, per-platform results.
     if (url.pathname === "/webhook/clip-posted" && req.method === "POST") {
-      // Simple shared-secret gate.
-      const auth = req.headers.get("authorization") ?? "";
-      if (!auth || auth !== `Bearer ${env.GPU_INTERNAL_SECRET}`) {
-        return new Response("forbidden", { status: 403 });
+      const auth = req.headers.get("x-n8n-secret") ?? req.headers.get("authorization") ?? "";
+      const validAuth =
+        (env.N8N_WEBHOOK_SECRET && auth === env.N8N_WEBHOOK_SECRET) ||
+        (env.GPU_INTERNAL_SECRET && auth === `Bearer ${env.GPU_INTERNAL_SECRET}`);
+      if (!validAuth) return new Response("forbidden", { status: 403 });
+
+      const body = await req.json<{
+        clip_id: string;
+        brand_id?: number;
+        blog_id?: number;
+        status: "posted" | "posted_partial" | "failed";
+        metricool_post_ids?: Record<string, string>;
+        post_urls?: Record<string, string>;
+        errors?: Record<string, string>;
+        published_at?: string;
+      }>();
+
+      const clip = await clipsDb.getClip(env.CLIP_DB, body.clip_id);
+      if (!clip) return new Response("clip not found", { status: 404 });
+
+      // Validate brand_id matches what was dispatched (catches mis-routed callbacks).
+      if (
+        body.brand_id != null &&
+        clip.dispatched_brand_id != null &&
+        body.brand_id !== clip.dispatched_brand_id
+      ) {
+        return new Response(
+          `brand_id mismatch: expected ${clip.dispatched_brand_id}, got ${body.brand_id}`,
+          { status: 400 },
+        );
       }
-      const body = await req.json<{ clip_id: string; post_urls: Record<string, string> }>();
-      await clipsDb.setStatus(env.CLIP_DB, body.clip_id, "posted", {
-        post_urls: JSON.stringify(body.post_urls ?? {}),
-        posted_at: new Date().toISOString(),
-      });
-      await clipsDb.appendApprovalLog(env.CLIP_DB, body.clip_id, "posted", "n8n", {
+
+      const kindMap: Record<"posted" | "posted_partial" | "failed", "posted" | "posted_partial" | "post_failed"> = {
+        posted: "posted",
+        posted_partial: "posted_partial",
+        failed: "post_failed",
+      };
+      const kind = kindMap[body.status] ?? "post_failed";
+
+      await clipsDb.setPostResult(
+        env.CLIP_DB,
+        body.clip_id,
+        kind,
+        body.post_urls ?? null,
+        body.metricool_post_ids ?? null,
+        body.errors ?? null,
+      );
+      await clipsDb.appendApprovalLog(env.CLIP_DB, body.clip_id, kind, "n8n", {
+        brand_id: body.brand_id,
         post_urls: body.post_urls,
+        metricool_post_ids: body.metricool_post_ids,
+        errors: body.errors,
+      });
+
+      const brandName = clip.dispatched_brand_name ?? String(body.brand_id ?? "unknown");
+      const blogId = clip.dispatched_blog_id ?? body.blog_id ?? null;
+      const dashboardUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review?id=${body.clip_id}`;
+
+      if (body.status === "failed") {
+        const errorLines = body.errors
+          ? Object.entries(body.errors)
+              .map(([p, m]) => `${p} → ${m}`)
+              .join("\n")
+          : "unknown";
+        await sendOpsAlert(env, {
+          clip_id: body.clip_id,
+          brand_name: brandName,
+          blog_id: blogId,
+          stage: "callback",
+          error: errorLines,
+          severity: "high",
+          dashboard_url: dashboardUrl,
+        });
+      } else if (body.status === "posted_partial") {
+        const livePlatforms = Object.keys(body.post_urls ?? {}).join(", ") || "none";
+        const failedLines = body.errors
+          ? Object.entries(body.errors)
+              .map(([p, m]) => `${p} → ${m}`)
+              .join("\n")
+          : "unknown";
+        await sendOpsAlert(env, {
+          clip_id: body.clip_id,
+          brand_name: brandName,
+          blog_id: blogId,
+          stage: "callback",
+          error: failedLines,
+          severity: "medium",
+          dashboard_url: dashboardUrl,
+          live_platforms: livePlatforms,
+        });
+      }
+
+      return Response.json({ ok: true });
+    }
+
+    // Internal route for post-worker → ops alert via service binding.
+    if (url.pathname === "/internal/ops-alert" && req.method === "POST") {
+      if (!checkInternal(req, env)) return new Response("forbidden", { status: 403 });
+      const body = await req.json<{
+        clip_id: string;
+        brand_name: string | null;
+        blog_id: number | null;
+        stage: string;
+        error: string;
+        severity: "high" | "medium";
+        dashboard_url?: string | null;
+        live_platforms?: string;
+      }>();
+      await sendOpsAlert(env, {
+        clip_id: body.clip_id,
+        brand_name: body.brand_name,
+        blog_id: body.blog_id,
+        stage: body.stage,
+        error: body.error,
+        severity: body.severity,
+        dashboard_url: body.dashboard_url ?? null,
+        live_platforms: body.live_platforms,
       });
       return Response.json({ ok: true });
     }
@@ -106,7 +213,7 @@ export default {
  * Returns `{ ok, channel }` where channel is "telegram" | "email" | "none".
  */
 async function sendTelegramWithFallback(
-  tg: TelegramClient,
+  _tg: TelegramClient,
   tgCall: () => Promise<unknown>,
   env: Env,
   emailSubject: string,
@@ -817,6 +924,18 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     return Response.json({ ok: true, username });
   }
 
+  // Dashboard: GET /api/dashboard/clips/:id  — ops detail view for any clip status
+  const dashClipMatch = /^\/api\/dashboard\/clips\/([^/]+)$/.exec(url.pathname);
+  if (dashClipMatch && req.method === "GET") {
+    const token = url.searchParams.get("t") ?? "";
+    const payload = await verifyJwt<{ purpose: string }>(env.DASHBOARD_JWT_SECRET, token);
+    if (!payload || payload.purpose !== "dashboard") return forbidden();
+    const clipId = dashClipMatch[1]!;
+    const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+    if (!clip) return new Response("not found", { status: 404 });
+    return Response.json({ clip });
+  }
+
   // Dashboard: GET /api/dashboard (JWT-protected via ?t= query param)
   if (url.pathname === "/api/dashboard" && req.method === "GET") {
     const token = url.searchParams.get("t") ?? "";
@@ -825,7 +944,8 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     // Use db.batch() for a single D1 round-trip instead of Promise.all (avoids timeout)
     const batchResults = await env.CLIP_DB.batch([
       env.CLIP_DB.prepare(
-        `SELECT id, status, triggered_by, triggered_at, posted_at, post_urls
+        `SELECT id, status, triggered_by, triggered_at, posted_at, post_urls,
+                dispatched_brand_name, dispatched_blog_id, dispatched_brand_id
          FROM clips ORDER BY triggered_at DESC LIMIT 50`,
       ),
       // Range comparison allows idx_clips_triggered_at to be used (no function wrapping)
@@ -914,6 +1034,155 @@ async function getClipForActiveReview(
   if (clip.status !== "pending_approval") return "expired";
   if (!isReviewWindowOpen(clip.sent_at)) return "expired";
   return clip;
+}
+
+// -------------------- Ops alert helper -------------------- //
+
+interface OpsAlertArgs {
+  clip_id: string;
+  brand_name: string | null;
+  blog_id: number | null;
+  stage: string;
+  error: string;
+  severity: "high" | "medium";
+  dashboard_url?: string | null;
+  live_platforms?: string;
+}
+
+async function sendOpsAlert(env: Env, args: OpsAlertArgs): Promise<void> {
+  const tg = new TelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const chatId = env.TELEGRAM_OPS_CHAT_ID ?? env.TELEGRAM_JORDY_CHAT_ID;
+  const shortId = args.clip_id.slice(0, 8);
+  const brandLine = args.brand_name
+    ? `Brand: ${args.brand_name}${args.blog_id != null ? ` (blog_id ${args.blog_id})` : ""}`
+    : "";
+
+  let text: string;
+  if (args.severity === "high") {
+    text = [
+      `🚨 Clip post failed`,
+      `Clip:  ${shortId}`,
+      brandLine,
+      `Stage: ${args.stage}`,
+      `Error: ${args.error}`,
+      args.dashboard_url ? `Open:  ${args.dashboard_url}` : "",
+    ].filter(Boolean).join("\n");
+  } else {
+    text = [
+      `⚠️ Clip posted partial`,
+      `Clip:  ${shortId}`,
+      brandLine,
+      args.live_platforms ? `Live:  ✅ ${args.live_platforms}` : "",
+      `Failed: ❌ ${args.error}`,
+      args.dashboard_url ? `Open:  ${args.dashboard_url}` : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  const emailSubject = `ClipFactory ops — clip ${shortId} ${args.severity === "high" ? "failed" : "partial"}`;
+  const emailHtml = `<pre>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</pre>`;
+
+  try {
+    await sendTelegramWithFallback(
+      tg,
+      () => tg.sendMessage({ chat_id: chatId, text }),
+      env,
+      emailSubject,
+      emailHtml,
+    );
+  } catch (err) {
+    console.error("sendOpsAlert failed", err);
+  }
+
+  // Guard against duplicate alerts.
+  await env.CLIP_DB.prepare(
+    `UPDATE clips SET alert_sent_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1`,
+  ).bind(args.clip_id).run().catch(() => {});
+}
+
+// -------------------- ready_to_post auto-retry sweeper -------------------- //
+
+async function sweepReadyToPost(env: Env): Promise<void> {
+  const intervalMinutes = parseInt(env.READY_TO_POST_RETRY_INTERVAL_MINUTES ?? "30", 10);
+  const maxRetries = parseInt(env.READY_TO_POST_MAX_RETRIES ?? "3", 10);
+
+  // Clips eligible for retry: waited long enough and haven't hit the cap yet.
+  const eligible = await env.CLIP_DB.prepare(
+    `SELECT id, auto_retry_count, dispatched_brand_name, dispatched_blog_id
+     FROM clips
+     WHERE status = 'ready_to_post'
+       AND auto_retry_count < ?1
+       AND (last_auto_retry_at IS NULL
+            OR last_auto_retry_at < datetime('now', '-' || ?2 || ' minutes'))`,
+  )
+    .bind(maxRetries, intervalMinutes)
+    .all<{ id: string; auto_retry_count: number; dispatched_brand_name: string | null; dispatched_blog_id: number | null }>();
+
+  for (const row of eligible.results ?? []) {
+    const nextCount = row.auto_retry_count + 1;
+    await env.CLIP_DB.prepare(
+      `UPDATE clips SET auto_retry_count = ?1, last_auto_retry_at = datetime('now') WHERE id = ?2`,
+    ).bind(nextCount, row.id).run();
+
+    await env.POST_DISPATCH.send({ clip_id: row.id, approved_by: `auto-retry-${nextCount}` });
+    await clipsDb.appendApprovalLog(env.CLIP_DB, row.id, "auto_retry_queued", "cron", {
+      attempt: nextCount,
+      max: maxRetries,
+    });
+  }
+
+  // Clips that have hit the retry cap — send Telegram alert and mark permanently failed.
+  const exhausted = await env.CLIP_DB.prepare(
+    `SELECT id, auto_retry_count, dispatched_brand_name, dispatched_blog_id
+     FROM clips
+     WHERE status = 'ready_to_post'
+       AND auto_retry_count >= ?1
+       AND alert_sent_at IS NULL`,
+  )
+    .bind(maxRetries)
+    .all<{ id: string; auto_retry_count: number; dispatched_brand_name: string | null; dispatched_blog_id: number | null }>();
+
+  for (const row of exhausted.results ?? []) {
+    const dashboardUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review?id=${row.id}`;
+    await sendOpsAlert(env, {
+      clip_id: row.id,
+      brand_name: row.dispatched_brand_name,
+      blog_id: row.dispatched_blog_id,
+      stage: "dispatch",
+      error: `Failed after ${row.auto_retry_count} auto-retries — manual intervention required`,
+      severity: "high",
+      dashboard_url: dashboardUrl,
+    });
+    await clipsDb.setStatus(env.CLIP_DB, row.id, "post_failed");
+    await clipsDb.appendApprovalLog(env.CLIP_DB, row.id, "post_failed", "cron", {
+      reason: `exhausted ${row.auto_retry_count} auto-retries`,
+    });
+  }
+}
+
+// -------------------- Stuck-callback sweeper -------------------- //
+
+async function sweepStuckDispatched(env: Env): Promise<void> {
+  const stuck = await env.CLIP_DB.prepare(
+    `SELECT id, dispatched_brand_name, dispatched_blog_id, dispatched_at
+     FROM clips
+     WHERE status = 'dispatched'
+       AND dispatched_at < datetime('now', '-15 minutes')
+       AND alert_sent_at IS NULL`,
+  ).all<{ id: string; dispatched_brand_name: string | null; dispatched_blog_id: number | null; dispatched_at: string }>();
+
+  for (const row of stuck.results ?? []) {
+    const dashboardUrl = `${env.DASHBOARD_URL.replace(/\/$/, "")}/review?id=${row.id}`;
+    await sendOpsAlert(env, {
+      clip_id: row.id,
+      brand_name: row.dispatched_brand_name,
+      blog_id: row.dispatched_blog_id,
+      stage: "timeout",
+      error: `No callback received >15 min after dispatch (dispatched_at: ${row.dispatched_at})`,
+      severity: "high",
+      dashboard_url: dashboardUrl,
+    });
+    // alert_sent_at is set inside sendOpsAlert above — clip stays in 'dispatched'
+  }
 }
 
 function forbidden(): Response {

@@ -19,3 +19,7 @@ max_batch_size = 5
 max_concurrency = 5
 max_retries = 3
 dead_letter_queue = "post-dispatch-dlq"
+
+[[services]]
+binding = "OPS"
+service = "clip-approval"

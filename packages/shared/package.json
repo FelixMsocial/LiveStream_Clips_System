@@ -9,6 +9,7 @@
     ".": "./src/index.ts",
     "./types": "./src/types.ts",
     "./clips": "./src/clips.ts",
+    "./metricool": "./src/metricool.ts",
     "./prompts": "./src/prompts.ts",
     "./r2": "./src/r2.ts",
     "./uuid": "./src/uuid.ts",
