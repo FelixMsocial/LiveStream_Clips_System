@@ -90,7 +90,6 @@ export async function createClip(
 }
 
 export async function extendClipDuration(
-  clientId: string,
   broadcasterToken: string,
   clipId: string,
   durationSec = 60,
@@ -98,7 +97,7 @@ export async function extendClipDuration(
   const res = await fetch(GQL, {
     method: "POST",
     headers: {
-      "Client-ID": clientId,
+      "Client-ID": GQL_PUBLIC_CLIENT_ID,
       Authorization: `Bearer ${stripBearerPrefix(broadcasterToken)}`,
       "Content-Type": "application/json",
     },

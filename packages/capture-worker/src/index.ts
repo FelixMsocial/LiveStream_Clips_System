@@ -57,7 +57,6 @@ async function handleOne(job: ClipIngestJob, env: Env): Promise<void> {
 
   // Best-effort: extend raw clip to 60 s before download. Falls back to 30 s default on failure.
   await extendClipDuration(
-    env.TWITCH_CLIENT_ID,
     env.TWITCH_BROADCASTER_OAUTH_TOKEN,
     created.id,
   ).catch((err) => console.warn("extendClipDuration failed, keeping 30s default:", err));

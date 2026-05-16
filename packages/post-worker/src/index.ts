@@ -7,7 +7,6 @@ import {
   metricoolDb,
   r2Signer,
   type CaptionsTriple,
-  type MetricoolBrand,
   type N8nPostPayload,
   type PostDispatchJob,
 } from "@clipfactory/shared";
@@ -91,7 +90,7 @@ async function handleOne(job: PostDispatchJob, env: Env): Promise<void> {
   const payload: N8nPostPayload = {
     clip_id: job.clip_id,
     video_url: videoUrl,
-    brand: { id: brand.id, brand_name: brand.brand_name, blog_id: brand.blog_id },
+    brand: { id: brand.id, brand_name: brand.brand_name, blog_id: brand.blog_id, user_id: brand.user_id, "x-mc-token": brand.mc_token },
     titles_per_platform: {
       youtube: clip.youtube_post_text ?? "",
       tiktok: clip.tiktok_post_text ?? "",

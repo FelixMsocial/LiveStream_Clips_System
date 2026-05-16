@@ -48,6 +48,7 @@ export default {
     ctx.waitUntil(checkHeartbeats(env));
     ctx.waitUntil(sweepStuckDispatched(env));
     ctx.waitUntil(sweepReadyToPost(env));
+    ctx.waitUntil(sweepFileCleanup(env));
   },
 
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1182,6 +1183,54 @@ async function sweepStuckDispatched(env: Env): Promise<void> {
       dashboard_url: dashboardUrl,
     });
     // alert_sent_at is set inside sendOpsAlert above — clip stays in 'dispatched'
+  }
+}
+
+// -------------------- R2 file cleanup (rejected / expired / posted) -------------------- //
+
+async function sweepFileCleanup(env: Env): Promise<void> {
+  // Process 5 clips per cron tick to stay well within R2/D1 rate limits.
+  const rows = await env.CLIP_DB.prepare(
+    `SELECT id, raw_clip_r2_key, final_clip_r2_key, status
+     FROM clips
+     WHERE (
+       (status IN ('rejected', 'expired'))
+       OR
+       (status IN ('posted', 'posted_partial')
+        AND posted_at IS NOT NULL
+        AND posted_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes'))
+     )
+     AND (raw_clip_r2_key IS NOT NULL OR final_clip_r2_key IS NOT NULL)
+     LIMIT 5`,
+  ).all<{ id: string; raw_clip_r2_key: string | null; final_clip_r2_key: string | null; status: string }>();
+
+  const clips = rows.results ?? [];
+  if (clips.length === 0) return;
+
+  for (const clip of clips) {
+    try {
+      if (clip.raw_clip_r2_key) await env.CLIP_BUCKET.delete(clip.raw_clip_r2_key);
+      if (clip.final_clip_r2_key) await env.CLIP_BUCKET.delete(clip.final_clip_r2_key);
+
+      const deletedKeys = [clip.raw_clip_r2_key, clip.final_clip_r2_key].filter(Boolean);
+      await env.CLIP_DB.batch([
+        env.CLIP_DB.prepare(
+          `UPDATE clips
+             SET raw_clip_r2_key = NULL,
+                 final_clip_r2_key = NULL,
+                 updated_at = datetime('now')
+           WHERE id = ?1`,
+        ).bind(clip.id),
+        env.CLIP_DB.prepare(
+          `INSERT INTO approval_log (clip_id, event_type, actor, details, event_at)
+           VALUES (?1, 'files_deleted', 'cron', ?2, datetime('now'))`,
+        ).bind(clip.id, JSON.stringify({ deleted_keys: deletedKeys, trigger_status: clip.status })),
+      ]);
+
+      console.log(`sweepFileCleanup: clip ${clip.id} (${clip.status}) — deleted ${deletedKeys.join(", ")}`);
+    } catch (e) {
+      console.error(`sweepFileCleanup: clip ${clip.id} failed, will retry next tick`, e);
+    }
   }
 }
 

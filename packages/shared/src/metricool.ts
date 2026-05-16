@@ -7,6 +7,8 @@ export interface MetricoolBrand {
   id: number;
   brand_name: string;
   blog_id: number;
+  user_id: string;
+  mc_token: string;
 }
 
 export async function pickNextBrand(db: D1): Promise<MetricoolBrand | null> {
@@ -26,7 +28,7 @@ export async function pickNextBrand(db: D1): Promise<MetricoolBrand | null> {
   if (!stateRow) return null;
 
   return await db
-    .prepare(`SELECT id, brand_name, blog_id FROM metricool_brands WHERE id = ?1`)
+    .prepare(`SELECT id, brand_name, blog_id, user_id, mc_token FROM metricool_brands WHERE id = ?1`)
     .bind(stateRow.last_brand_id)
     .first<MetricoolBrand>();
 }

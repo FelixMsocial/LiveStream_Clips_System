@@ -190,7 +190,7 @@ export interface CaptionsTriple {
 export interface N8nPostPayload {
   clip_id: string;
   video_url: string;
-  brand: { id: number; brand_name: string; blog_id: number };
+  brand: { id: number; brand_name: string; blog_id: number; user_id: string; "x-mc-token": string };
   titles_per_platform: { youtube: string; tiktok: string; instagram: string };
   publish_now: true;
   // backwards-compat for one release: mirror of titles_per_platform
