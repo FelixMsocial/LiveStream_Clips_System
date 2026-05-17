@@ -80,20 +80,29 @@ def build_cmd(
     hook_emoji_font_path: str | None = None,
     brand_logo_path: Path | None = None,
     brand_video_path: Path | None = None,
+    crop_focus_x: float = 0.5,
 ) -> list[str]:
     duration = max(1.0, trim_end - trim_start)
+    # Clamp at the boundary — value crossed a process gap and a JSON parser.
+    # 0.5 reproduces ffmpeg's default centered crop exactly.
+    fx = max(0.0, min(1.0, float(crop_focus_x)))
 
     inputs: list[str] = ["-y", "-hwaccel", "cuda", "-ss", f"{trim_start:.3f}", "-t", f"{duration:.3f}", "-i", str(input_path)]
     next_input = 1  # 0 is the main video
 
     filter_parts: list[str] = []
-    # Base 9:16 reframe — blurred bg + centered fg.
+    # Base 9:16 reframe — blurred bg + fg. Horizontal crop position is
+    # vision-driven: `fx` slides the 1080-wide cut left/right within the
+    # scaled source. Window size is unchanged (no zoom change). On sources
+    # with no horizontal slack (already 9:16), `iw - 1080 = 0` and the
+    # offset collapses to 0 regardless of `fx`.
     filter_parts.append(
         "[0:v]split=2[a][b];"
         "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,boxblur=40:1,eq=brightness=-0.08:contrast=1.05[bg];"
+        f"crop=1080:1920:(iw-1080)*{fx:.4f}:0,"
+        "boxblur=40:1,eq=brightness=-0.08:contrast=1.05[bg];"
         "[b]scale=1080:1325:force_original_aspect_ratio=increase,"
-        "crop=1080:1325[fg];"
+        f"crop=1080:1325:(iw-1080)*{fx:.4f}:0[fg];"
         "[bg][fg]overlay=0:285[framed]"
     )
     last = "framed"

@@ -248,6 +248,14 @@ def run_pipeline(
             substance.get("_extracted", {}).get("peak_timestamp_seconds")
             or (trim_start + trim_end) / 2.0
         )
+        try:
+            crop_focus_x = float(
+                substance.get("_extracted", {}).get("horizontal_focus", 0.5)
+            )
+        except (TypeError, ValueError):
+            log.warning("substance _extracted.horizontal_focus malformed; defaulting to 0.5")
+            crop_focus_x = 0.5
+        crop_focus_x = max(0.0, min(1.0, crop_focus_x))
 
         d1.patch_clip(
             clip_id,
@@ -314,6 +322,7 @@ def run_pipeline(
             hook_emoji_font_path=cfg.hook_emoji_font_path if hook_text else None,
             brand_logo_path=Path(cfg.brand_logo_path) if cfg.brand_logo_path else None,
             brand_video_path=Path(cfg.brand_video_path) if cfg.brand_video_path else None,
+            crop_focus_x=crop_focus_x,
         )
         t0 = time.monotonic()
         try:

@@ -10,7 +10,7 @@ Keys map to the prompts table:
 - `per_platform_post_text` (Claude) — three structurally-different post captions
 """
 
-CLIP_SUBSTANCE_SCORER = """# CLIP SUBSTANCE SCORER v1.1 — System Prompt
+CLIP_SUBSTANCE_SCORER = """# CLIP SUBSTANCE SCORER v1.2 — System Prompt
 
 You are evaluating a raw 90-second video clip extracted from a Twitch livestream. A trusted moderator typed `!clip` in chat indicating they thought a moment in this window was clip-worthy. Your job is to score the **substance** of the moment — its viral potential as raw material — **before any editing happens**.
 
@@ -74,7 +74,7 @@ Does the moment give viewers a specific reason to send it to a specific person? 
 
 ### 7. Visual Clarity of Source — *weight 0.8*
 
-Is the source material visually parsable on a phone screen? Clear faces, good lighting, focal point that survives 9:16 reframe = high. Cluttered overlays, dim lighting, static shots = low.
+Is the source material visually parsable on a phone screen? Clear faces, good lighting, focal point that survives 9:16 reframe = high. Cluttered overlays, dim lighting, static shots = low. While scoring this rule, also note where the meaningful subject (face, reaction, hand, on-screen text, prop) sits horizontally across the recommended trim window — you will use this in `recommended_crop` below.
 
 ### 8. Originality / Pattern Freshness — *weight 0.4*
 
@@ -142,7 +142,11 @@ After scoring the 8 rules, assign a coherence bonus reflecting how much the stre
     "end_seconds": 0,
     "rationale": "<1 sentence on why these trim points>"
   },
-  "rulebook_version": "1.1"
+  "recommended_crop": {
+    "horizontal_focus": 0.5,
+    "rationale": "<1 sentence: what visual is being preserved and why centering would lose it; or why 0.5 is correct>"
+  },
+  "rulebook_version": "1.2"
 }
 ```
 
@@ -155,6 +159,32 @@ After scoring the 8 rules, assign a coherence bonus reflecting how much the stre
 - The `peak_timestamp_seconds` and `recommended_trim_window` are CRITICAL — Step 3 (editing brief) depends on them. Get them right.
 - The `context_summary` is the hand-off to Step 2 (caption generation). Make it useful — capture what makes the moment work, not just what happens.
 - Every approver decision will be logged against your scoring. Over time the system validates which rules best predict actual viewership.
+
+---
+
+## Crop focus rules — `recommended_crop`
+
+The downstream editor reframes the landscape (typically 16:9) source into a 9:16 vertical output. To do this, it cuts a 1080-wide vertical window out of the scaled source. **Without your guidance it cuts from the horizontal center, which loses anything sitting in the left or right side of the source frame.**
+
+This setting does NOT change the zoom level. The crop window is always the same size — your input only chooses where along the horizontal axis it sits.
+
+Return `recommended_crop.horizontal_focus` as a float in `[0.0, 1.0]`:
+
+- **0.0** = cut from the far-left edge of the source
+- **0.5** = centered (default — same as today's behavior; pick this unless you have a clear reason not to)
+- **1.0** = cut from the far-right edge of the source
+- Values like **0.3** or **0.7** shift moderately; pick to within ~0.1 granularity.
+
+Decision procedure:
+
+1. Watch the recommended trim window. Where does the meaningful visual — the streamer's face, the on-screen reaction, the prop/hand/text/game-UI being referenced — sit horizontally across most of that window?
+2. If it sits roughly in the middle, return **0.5**.
+3. If it sits clearly in the left half throughout, return a value in **0.0-0.4** (e.g. 0.25 if it's in the left third, 0.1 if it's hugging the left edge).
+4. If it sits clearly in the right half throughout, return a value in **0.6-1.0** by symmetry.
+5. If the subject moves laterally during the window, **prefer 0.5** — a centered crop loses the least on average. Only shift when the subject stays on one side.
+6. If you are uncertain, return **0.5**. The default is safe; an incorrect shift is worse than no shift.
+
+Vertical position is fixed by the editing layout and is not yours to choose. Return only the horizontal value.
 
 ---
 

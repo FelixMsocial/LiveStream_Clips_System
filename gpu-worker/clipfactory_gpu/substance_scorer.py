@@ -42,12 +42,17 @@ def _degraded(duration_sec: float) -> dict[str, Any]:
             "end_seconds": end,
             "rationale": "midpoint fallback (Gemini unavailable)",
         },
-        "rulebook_version": "1.1-degraded",
+        "recommended_crop": {
+            "horizontal_focus": 0.5,
+            "rationale": "degraded fallback",
+        },
+        "rulebook_version": "1.2-degraded",
         "_extracted": {
             "peak_timestamp_seconds": mid,
             "peak_emotion": "low_arousal",
             "extractable_element": "",
             "trigger_type": "none",
+            "horizontal_focus": 0.5,
         },
         "degraded": True,
     }
@@ -231,11 +236,27 @@ def _validate_and_extract(d: dict[str, Any], duration_sec: float) -> dict[str, A
     rule4 = rs.get("4_quotable_memorable_beat", {})
     rule6 = rs.get("6_share_trigger", {})
 
+    # Optional crop hint — never raise; bad values fall back to 0.5 (current
+    # center-crop behavior). Canonicalize on the returned blob so D1 stores
+    # the clamped value.
+    rc = d.get("recommended_crop")
+    if not isinstance(rc, dict):
+        rc = {"horizontal_focus": 0.5, "rationale": "missing; defaulted to center"}
+        d["recommended_crop"] = rc
+    try:
+        focus = _to_float(rc.get("horizontal_focus", 0.5), field="recommended_crop.horizontal_focus")
+        focus = _clamp(focus, 0.0, 1.0)
+    except ValueError as e:
+        log.warning("substance scorer returned bad horizontal_focus; defaulting to 0.5: %s", e)
+        focus = 0.5
+    rc["horizontal_focus"] = round(focus, 4)
+
     d["_extracted"] = {
         "peak_timestamp_seconds": peak_ts,
         "peak_emotion": rule2.get("peak_emotion", "mixed"),
         "extractable_element": rule4.get("extractable_element", ""),
         "trigger_type": rule6.get("trigger_type", "none"),
+        "horizontal_focus": focus,
     }
     return d
 
