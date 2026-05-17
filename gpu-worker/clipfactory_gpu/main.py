@@ -44,10 +44,10 @@ class Daemon:
             cfg.gpu_internal_secret,
             worker_id=cfg.gpu_worker_id,
         )
-        self.prompts: dict[str, str] = {}
+        self._prompts_cache: dict[str, dict[str, str]] = {}  # tag → {key: body}
         self._running = True
         self._last_heartbeat = 0.0
-        self._last_prompt_fetch = 0.0
+        self._last_prompt_fetch: dict[str, float] = {}  # tag → monotonic timestamp
         self._heartbeat_failures = 0
         self._pull_failures = 0
         self._last_worker_alert: dict[str, float] = {}
@@ -83,26 +83,50 @@ class Daemon:
         self.d1.send_alert(alert_type=alert_type, message=message)
         self._last_worker_alert[alert_type] = now
 
-    def _load_prompts(self) -> None:
-        """Load prompts from D1 API, falling back to hardcoded prompts_fallback."""
+    def _get_prompts(self, tag: str) -> dict[str, str]:
+        """Return prompts for `tag`, fetching from D1 if stale or missing.
+
+        Falls back to prompts_fallback.PROMPTS[tag] (then 'gameplay') on API failure.
+        """
         from . import prompts_fallback
 
-        if time.monotonic() - self._last_prompt_fetch < PROMPT_REFRESH_SEC and self.prompts:
-            return  # Still fresh
-        fetched = self.d1.fetch_prompts()
+        now = time.monotonic()
+        last = self._last_prompt_fetch.get(tag, 0.0)
+        cached = self._prompts_cache.get(tag)
+        if cached and now - last < PROMPT_REFRESH_SEC:
+            return cached
+
+        fetched = self.d1.fetch_prompts(tag=tag)
         if fetched:
-            log.info("loaded %d prompts from D1 API", len(fetched))
-            self.prompts = fetched
-        elif not self.prompts:
-            log.info("using fallback prompts (D1 API unavailable)")
-            self.prompts = prompts_fallback.PROMPTS
-        else:
-            log.warning("prompt fetch failed, retaining stale prompts (next retry in %ds)", int(PROMPT_REFRESH_SEC))
-        # Always update timestamp to enforce cooldown, even on failure.
-        self._last_prompt_fetch = time.monotonic()
+            log.info("loaded %d prompts from D1 API (tag=%s)", len(fetched), tag)
+            self._prompts_cache[tag] = fetched
+            self._last_prompt_fetch[tag] = now
+            return fetched
+
+        # API unavailable — use fallback module, then 'gameplay' if tag missing.
+        if cached:
+            log.warning(
+                "prompt fetch failed (tag=%s), retaining stale cache (retry in %ds)",
+                tag, int(PROMPT_REFRESH_SEC),
+            )
+            self._last_prompt_fetch[tag] = now
+            return cached
+
+        fallback = (
+            prompts_fallback.PROMPTS.get(tag)
+            or prompts_fallback.PROMPTS["gameplay"]
+        )
+        log.info("using fallback prompts (tag=%s, D1 API unavailable)", tag)
+        self._prompts_cache[tag] = fallback
+        self._last_prompt_fetch[tag] = now
+        return fallback
+
+    def _preload_prompts(self) -> None:
+        """Pre-warm the gameplay prompt cache at startup."""
+        self._get_prompts("gameplay")
 
     def run(self) -> None:
-        self._load_prompts()
+        self._preload_prompts()
         self._beat()
         while self._running:
             try:
@@ -125,11 +149,10 @@ class Daemon:
 
             if not msgs:
                 self._beat()
-                self._load_prompts()
+                self._preload_prompts()  # keep gameplay cache warm during idle
                 time.sleep(IDLE_SLEEP_SEC)
                 continue
 
-            self._load_prompts()
             for m in msgs:
                 self._handle(m)
             self._beat()
@@ -147,11 +170,13 @@ class Daemon:
             self.q.ack([m.lease_id])
             return
         try:
+            content_tag = body.get("content_tag") or "gameplay"
+            prompts = self._get_prompts(content_tag)
             run_pipeline(
                 cfg=self.cfg,
                 r2=self.r2,
                 d1=self.d1,
-                prompts=self.prompts,
+                prompts=prompts,
                 clip_id=clip_id,
                 raw_clip_r2_key=raw_key,
                 stream_session_id=body.get("stream_session_id"),

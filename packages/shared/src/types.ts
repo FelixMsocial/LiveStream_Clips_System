@@ -37,12 +37,14 @@ export interface ClipIngestJob {
   triggered_at: string; // ISO8601
   label?: string;
   stream_session_id?: string;
+  content_tag?: string; // 'gameplay' | 'vlog' | ... — defaults to 'gameplay'
 }
 
 export interface ClipEditJob {
   clip_id: string;
   raw_clip_r2_key: string;
   stream_session_id?: string;
+  content_tag?: string; // forwarded from ClipIngestJob
 }
 
 export interface ApprovalSendJob {

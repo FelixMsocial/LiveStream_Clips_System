@@ -105,14 +105,16 @@ class D1Api:
             log.warning("alert send failed (%s): %s", alert_type, e)
             return False
 
-    def fetch_prompts(self) -> dict[str, str] | None:
-        """Fetch latest prompt bodies from D1 via approval-worker.
+    def fetch_prompts(self, tag: str = "gameplay") -> dict[str, str] | None:
+        """Fetch latest prompt bodies from D1 via approval-worker for a given tag.
 
         Returns a dict mapping prompt key → body, or None on failure.
+        The API performs per-key fallback to 'gameplay' for any key missing in the tag.
         """
         try:
             r = self._c.get(
                 f"{self._base}/prompts",
+                params={"tag": tag},
                 headers=self._headers,
                 timeout=10.0,
             )
@@ -123,5 +125,5 @@ class D1Api:
                 return prompts
             return None
         except Exception as e:
-            log.warning("fetch_prompts failed: %s", e)
+            log.warning("fetch_prompts(tag=%s) failed: %s", tag, e)
             return None

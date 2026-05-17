@@ -13,13 +13,14 @@ export async function insertClip(
     label: string | null;
     status: ClipStatus;
     stream_session_id?: string | null;
+    content_tag?: string | null;
   },
 ): Promise<void> {
   await db
     .prepare(
       `INSERT INTO clips
-         (id, triggered_by, triggered_at, label, status, stream_session_id)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+         (id, triggered_by, triggered_at, label, status, stream_session_id, content_tag)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
     )
     .bind(
       row.id,
@@ -28,6 +29,7 @@ export async function insertClip(
       row.label ?? null,
       row.status,
       row.stream_session_id ?? null,
+      row.content_tag ?? "gameplay",
     )
     .run();
 }

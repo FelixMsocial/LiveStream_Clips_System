@@ -742,17 +742,50 @@ async function handleApi(req: Request, url: URL, env: Env): Promise<Response> {
     return Response.json({ ok: result.ok, channel: result.channel });
   }
 
-  // GPU worker → fetch latest prompts from D1.
+  // GPU worker → fetch latest prompts from D1, scoped to a content tag.
+  // Falls back to 'gameplay' for any key not present in the requested tag.
   if (url.pathname === "/api/internal/prompts" && req.method === "GET") {
     if (!checkInternal(req, env)) return forbidden();
-    const rows = await env.CLIP_DB.prepare(
-      `SELECT p.key, p.body FROM prompts p
-       INNER JOIN (SELECT key, MAX(version) AS max_v FROM prompts GROUP BY key) latest
-       ON p.key = latest.key AND p.version = latest.max_v`,
-    ).all<{ key: string; body: string }>();
+    const tag = url.searchParams.get("tag") ?? "gameplay";
     const prompts: Record<string, string> = {};
-    for (const r of rows.results ?? []) prompts[r.key] = r.body;
+    // Fetch latest rows for the requested tag.
+    const tagRows = await env.CLIP_DB.prepare(
+      `SELECT p.key, p.body FROM prompts p
+       INNER JOIN (SELECT key, MAX(version) AS max_v FROM prompts WHERE tag = ?1 GROUP BY key) latest
+       ON p.key = latest.key AND p.version = latest.max_v AND p.tag = ?1`,
+    ).bind(tag).all<{ key: string; body: string }>();
+    for (const r of tagRows.results ?? []) prompts[r.key] = r.body;
+    // Fill any missing keys from the 'gameplay' fallback (no-op when tag='gameplay').
+    if (tag !== "gameplay") {
+      const fallbackRows = await env.CLIP_DB.prepare(
+        `SELECT p.key, p.body FROM prompts p
+         INNER JOIN (SELECT key, MAX(version) AS max_v FROM prompts WHERE tag = 'gameplay' GROUP BY key) latest
+         ON p.key = latest.key AND p.version = latest.max_v AND p.tag = 'gameplay'`,
+      ).all<{ key: string; body: string }>();
+      for (const r of fallbackRows.results ?? []) {
+        if (!(r.key in prompts)) prompts[r.key] = r.body;
+      }
+    }
     return Response.json({ prompts });
+  }
+
+  // Admin → upsert stream session content tag.
+  // POST /api/internal/sessions/:id/tag  { content_tag: "vlog" }
+  const sessionTagMatch = /^\/api\/internal\/sessions\/([^/]+)\/tag$/.exec(url.pathname);
+  if (sessionTagMatch && req.method === "POST") {
+    if (!checkInternal(req, env)) return forbidden();
+    const sessionId = sessionTagMatch[1]!;
+    const { content_tag } = await req.json<{ content_tag: string }>();
+    if (!content_tag || typeof content_tag !== "string") {
+      return Response.json({ error: "content_tag required" }, { status: 400 });
+    }
+    await env.CLIP_DB.prepare(
+      `INSERT INTO stream_sessions (id, content_tag)
+       VALUES (?1, ?2)
+       ON CONFLICT(id) DO UPDATE SET content_tag = excluded.content_tag,
+                                     updated_at = datetime('now')`,
+    ).bind(sessionId, content_tag).run();
+    return Response.json({ ok: true, session_id: sessionId, content_tag });
   }
 
   // GPU worker → patch clip row.

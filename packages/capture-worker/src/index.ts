@@ -107,6 +107,7 @@ async function handleOne(job: ClipIngestJob, env: Env): Promise<void> {
     clip_id,
     raw_clip_r2_key: rawKey,
     stream_session_id: job.stream_session_id,
+    content_tag: job.content_tag,
   };
   await env.CLIP_EDIT.send(editJob);
 }

@@ -269,6 +269,12 @@ export class ChatListenerDO {
       this.currentSessionId = todaySession;
     }
 
+    // Resolve content_tag for this session (defaults to 'gameplay' if no row exists).
+    const sessionRow = await this.env.CLIP_DB
+      .prepare(`SELECT content_tag FROM stream_sessions ORDER BY updated_at DESC LIMIT 1`)
+      .first<{ content_tag: string }>();
+    const contentTag = sessionRow?.content_tag ?? "gameplay";
+
     if (!whitelisted) {
       // Still record for visibility, but do not enqueue.
       await withRetry(
@@ -279,6 +285,7 @@ export class ChatListenerDO {
           label,
           status: "ignored",
           stream_session_id: this.currentSessionId,
+          content_tag: contentTag,
         }),
         { label: "insertClip:ignored" },
       );
@@ -296,6 +303,7 @@ export class ChatListenerDO {
           label,
           status: "raw",
           stream_session_id: this.currentSessionId,
+          content_tag: contentTag,
         }),
         { label: "insertClip:raw" },
       );
@@ -318,6 +326,7 @@ export class ChatListenerDO {
         triggered_at: triggeredAt,
         label: label ?? undefined,
         stream_session_id: this.currentSessionId ?? undefined,
+        content_tag: contentTag,
       };
       await withRetry(
         () => this.env.CLIP_INGEST.send(job),
