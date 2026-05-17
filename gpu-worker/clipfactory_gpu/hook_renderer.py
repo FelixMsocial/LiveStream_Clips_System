@@ -18,7 +18,7 @@ import sys
 import unicodedata
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +165,28 @@ def _wrap_to_pixels(
     return lines
 
 
+def _truncate_lines(
+    lines: list[str],
+    max_lines: int,
+    text_font: ImageFont.FreeTypeFont,
+    emoji_font: ImageFont.FreeTypeFont | None,
+    emoji_scale: float,
+    max_width: int,
+) -> list[str]:
+    """Trim to max_lines, ellipsizing the last line so cut content is signalled."""
+    result = list(lines[: max_lines - 1])
+    last = lines[max_lines - 1]
+    words = last.split(" ")
+    while words:
+        candidate = " ".join(words) + "…"
+        if _measure_line(candidate, text_font, emoji_font, emoji_scale) <= max_width:
+            result.append(candidate)
+            return result
+        words.pop()
+    result.append("…")
+    return result
+
+
 def _normalize(text: str) -> str:
     """Strip unrenderable categories and collapse whitespace/escape literals."""
     keep = "".join(c for c in text if unicodedata.category(c) not in _HOOK_STRIP_CATS)
@@ -208,19 +230,22 @@ def render_hook_png(
     text_font_path: str,
     emoji_font_path: str | None = None,
     font_size: int = 55,
-    max_text_width: int = 940,
+    box_width: int = 990,
+    max_lines: int = 2,
     pad_x: int = 28,
     pad_y: int = 18,
-    corner_radius: int = 18,
+    corner_radius: int = 24,
     line_spacing: int = 10,
-    bg_rgba: tuple[int, int, int, int] = (255, 255, 255, 230),
+    bg_rgba: tuple[int, int, int, int] = (255, 255, 255, 255),
     text_rgba: tuple[int, int, int, int] = (0, 0, 0, 255),
-    frame_width: int = 1080,
 ) -> tuple[int, int] | None:
-    """Render the hook to a transparent rounded-rect PNG.
+    """Render the hook to a transparent PNG: fixed-width white rounded rect,
+    drop shadow, bold black text, capped at max_lines with ellipsis.
 
     Returns the rendered (width, height) in pixels on success, or None if
     there was nothing to render or the text font could not be loaded.
+    The PNG is wider than box_width by the shadow spread so the white box
+    left edge sits exactly at the FFmpeg overlay x offset (45px).
     """
     cleaned = _normalize(text)
     if not cleaned:
@@ -235,41 +260,55 @@ def render_hook_png(
     if emoji_font_path and Path(emoji_font_path).exists():
         emoji_font, emoji_scale = _load_emoji_font(emoji_font_path, font_size)
 
+    max_text_width = box_width - 2 * pad_x
     lines = _wrap_to_pixels(cleaned, text_font, emoji_font, emoji_scale, max_text_width)
     if not lines:
         return None
+    if len(lines) > max_lines:
+        lines = _truncate_lines(lines, max_lines, text_font, emoji_font, emoji_scale, max_text_width)
 
     line_widths = [_measure_line(line, text_font, emoji_font, emoji_scale) for line in lines]
-    block_w = max(line_widths)
 
     asc, desc = text_font.getmetrics()
     line_h = asc + desc
     block_h = line_h * len(lines) + line_spacing * max(0, len(lines) - 1)
+    box_h = block_h + 2 * pad_y
 
-    img_w = block_w + 2 * pad_x
-    img_h = block_h + 2 * pad_y
+    # Shadow: offset (right, down) + gaussian blur.  The PNG is enlarged by
+    # the shadow spread so nothing is clipped; the white box still starts at
+    # (0, 0) matching the FFmpeg overlay x=45 anchor.
+    _SH_X = 3
+    _SH_Y = 5
+    _SH_BLUR = 8
+    _SH_ALPHA = 60
 
-    # Hard safety: never let the PNG exceed the frame width — if it did,
-    # FFmpeg's overlay=(W-w)/2 would go negative and the box would be
-    # clamped to x=0 (left edge). Clamp here so the box stays centered
-    # even if a measurement drift occurs.
-    if img_w > frame_width:
-        img_w = frame_width
-        block_w = img_w - 2 * pad_x
+    extra_w = _SH_X + _SH_BLUR * 2
+    extra_h = _SH_Y + _SH_BLUR * 2
+    img_w = box_width + extra_w
+    img_h = box_h + extra_h
+
+    shadow_layer = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow_layer)
+    shadow_draw.rounded_rectangle(
+        [(_SH_X, _SH_Y), (_SH_X + box_width - 1, _SH_Y + box_h - 1)],
+        radius=corner_radius,
+        fill=(0, 0, 0, _SH_ALPHA),
+    )
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=_SH_BLUR))
 
     img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+    img.alpha_composite(shadow_layer)
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle(
-        [(0, 0), (img_w - 1, img_h - 1)],
+        [(0, 0), (box_width - 1, box_h - 1)],
         radius=corner_radius,
         fill=bg_rgba,
     )
 
-    # Center each line horizontally within the image. img_w/2 is the
-    # absolute center; line gets x = center - lw/2.
+    # Center each line within the white box (box_width), not the full image.
     y = pad_y
     for line, lw in zip(lines, line_widths):
-        x = (img_w - lw) // 2
+        x = (box_width - lw) // 2
         _draw_line(img, draw, x, y, line, text_font, emoji_font, emoji_scale, text_rgba)
         y += line_h + line_spacing
 

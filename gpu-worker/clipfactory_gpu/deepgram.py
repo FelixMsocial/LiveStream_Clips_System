@@ -81,15 +81,15 @@ def words_to_ass(
     max_chars: int = 32,
     max_duration: float = 2.5,
     font_name: str = "Poppins SemiBold",
-    font_size: int = 65,
-    margin_v: int = 576,
+    font_size: int = 76,
+    margin_v: int = 385,
     outline: int = 6,
 ) -> str:
     """Render an ASS subtitle file with per-word karaoke (\\k) timing.
 
     Each cue is a phrase (≤max_chars / ≤max_duration). Within a cue, every
     word is wrapped in {\\k<centiseconds>} so the active word flips from
-    SecondaryColour (yellow) to PrimaryColour (white) as it is spoken.
+    SecondaryColour (white) to PrimaryColour (yellow) as it is spoken.
 
     PlayResX/Y must match the output frame (1080×1920) so libass maps
     MarginV and font sizes to the correct coordinate space.
@@ -113,8 +113,8 @@ def words_to_ass(
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_name},{font_size},"
-        "&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,"
-        f"0,0,0,0,100,100,0,0,1,{outline},0,2,40,40,"
+        "&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline},1,2,40,40,"
         f"{margin_v},1\n"
         "\n"
         "[Events]\n"

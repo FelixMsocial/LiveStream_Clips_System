@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 
 # Vertical position of the hook PNG from the top of the 1920px frame.
-HOOK_TOP_MARGIN = 80
+HOOK_TOP_MARGIN = 155
 
 
 @dataclass(frozen=True)
@@ -61,14 +61,15 @@ def build_cmd(
     filter_parts.append(
         "[0:v]split=2[a][b];"
         "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,boxblur=40:1[bg];"
-        "[b]scale=1080:-2[fg];"
-        "[bg][fg]overlay=0:(H-h)/2[framed]"
+        "crop=1080:1920,boxblur=40:1,eq=brightness=-0.08:contrast=1.05[bg];"
+        "[b]scale=1080:1325:force_original_aspect_ratio=increase,"
+        "crop=1080:1325[fg];"
+        "[bg][fg]overlay=0:285[framed]"
     )
     last = "framed"
 
-    # Burn-in captions. Style (font=65pt, PlayRes 1080×1920, MarginV=576 = 30%
-    # from bottom, karaoke palette) is owned by the ASS from deepgram.words_to_ass.
+    # Burn-in captions. Style (font=65pt, PlayRes 1080×1920, MarginV=360,
+    # karaoke palette) is owned by the ASS from deepgram.words_to_ass.
     if subtitles_path and subtitles_path.exists() and subtitles_path.stat().st_size > 0:
         # Escape backslashes and colons for ffmpeg's filtergraph parser.
         sub_escaped = (
@@ -95,7 +96,7 @@ def build_cmd(
                 "unsharp=3:3:0.50:3:3:0.00,"
                 f"colorchannelmixer=aa={sponsor.opacity}[sp]"
             )
-            pos = "(W-w)/2:H-h-8+870-90:shortest=1"
+            pos = "(W-w)/2:1655:shortest=1"
         else:
             inputs += ["-i", str(sponsor.path)]
             sw = int(1080 * sponsor.scale_pct)
@@ -136,7 +137,6 @@ def build_cmd(
                 text_font_path=hook_font_path,
                 emoji_font_path=hook_emoji_font_path or None,
                 font_size=55,
-                max_text_width=940,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("hook PNG render failed: %s — skipping hook overlay", e)
@@ -146,7 +146,7 @@ def build_cmd(
             inputs += ["-i", str(hook_png)]
             next_input += 1
             filter_parts.append(
-                f"[{last}][{hook_idx}:v]overlay=x=(W-w)/2:y={HOOK_TOP_MARGIN}[hooked]"
+                f"[{last}][{hook_idx}:v]overlay=x=45:y={HOOK_TOP_MARGIN}[hooked]"
             )
             last = "hooked"
     elif hook_text and hook_font_path:

@@ -13,15 +13,45 @@ def _default_font_path() -> str:
     """Return the best available bold sans-serif font for the current platform."""
     if sys.platform == "win32":
         candidates = [
-            r"C:\Windows\Fonts\arialbd.ttf",   # Arial Bold (virtually universal)
-            r"C:\Windows\Fonts\calibrib.ttf",   # Calibri Bold
-            r"C:\Windows\Fonts\tahoma.ttf",     # Tahoma
+            r"C:\Windows\Fonts\Poppins-SemiBold.ttf",  # Poppins SemiBold (preferred)
+            r"C:\Windows\Fonts\arialbd.ttf",            # Arial Bold (fallback)
+            r"C:\Windows\Fonts\calibrib.ttf",           # Calibri Bold
+            r"C:\Windows\Fonts\tahoma.ttf",             # Tahoma
         ]
         for p in candidates:
             if Path(p).exists():
                 return p
-        return r"C:\Windows\Fonts\arialbd.ttf"  # will warn at render time if absent
-    # Linux / Ubuntu server default
+        return r"C:\Windows\Fonts\Poppins-SemiBold.ttf"  # will warn at render time if absent
+
+    # Linux: query fontconfig (same lookup libass uses for caption rendering) so
+    # we get the real on-disk path rather than guessing installation directories.
+    import subprocess
+    for query in (
+        "Poppins SemiBold:weight=600",
+        "Liberation Sans:bold",
+        "sans-serif:bold",
+    ):
+        try:
+            result = subprocess.run(
+                ["fc-match", query, "--format=%{file}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            path = result.stdout.strip()
+            if result.returncode == 0 and path and Path(path).exists():
+                return path
+        except Exception:
+            pass
+
+    # Static fallbacks when fc-match is unavailable.
+    linux_candidates = [
+        "/usr/share/fonts/truetype/poppins/Poppins-SemiBold.ttf",
+        "/usr/local/share/fonts/Poppins-SemiBold.ttf",
+        "/usr/share/fonts/Poppins-SemiBold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    for p in linux_candidates:
+        if Path(p).exists():
+            return p
     return "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
 
