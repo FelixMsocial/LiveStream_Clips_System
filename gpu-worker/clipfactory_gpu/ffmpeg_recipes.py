@@ -24,6 +24,34 @@ log = logging.getLogger(__name__)
 # Vertical position of the hook PNG from the top of the 1920px frame.
 HOOK_TOP_MARGIN = 155
 
+# Brand logo overlay sits centered in the bottom blurred band. The foreground
+# video occupies y=285..1610 (1325px tall, see the framed filter), so the
+# blurred band underneath spans y=1610..1920 — center at y=1765.
+BRAND_LOGO_TARGET_WIDTH = 1164    # ~42px overflow each side (clips corner tips)
+BRAND_LOGO_BAND_CENTER_Y = 1765
+
+# Animated MP4 brand overlay. Authored full-frame (1080x1920) with a bright
+# green background; we scale + offset so the inner pill lands inside the
+# brand-logo box, below the "MojoOnPC" text. Derivation (see scripts/
+# probe_overlay_positions.py and probe_logo_box.py):
+#   - Source pill center in MP4: (540, 958), size 408x108
+#   - Scale 0.9028 (~9.7% from native) → scaled MP4 975x1733, pill center (488, 865)
+#   - Logo box at 1164 wide spans frame y≈1593..1938; MojoOnPC text bottom
+#     sits at frame y≈1757, box visible bottom at y≈1888
+#   - Pill centered between text bottom and box bottom: y=1822
+#   - Overlay offsets: x = (1080 - 975)/2 ≈ 53, y = 1822 - 865 = 957
+BRAND_VIDEO_WIDTH = 975           # ~9.7% reduction from native 1080
+BRAND_VIDEO_X = 53                # overlay x offset (keeps MP4 centered)
+BRAND_VIDEO_Y = 957               # overlay y offset (pill center at y≈1822)
+BRAND_VIDEO_CHROMA_COLOR = "0x00FF00"
+BRAND_VIDEO_CHROMA_SIMILARITY = 0.30
+BRAND_VIDEO_CHROMA_BLEND = 0.05
+# Despill removes residual green tint left behind by chromakey on
+# anti-aliased edges. mix=1.0 fully neutralizes; expand widens the
+# detection range.
+BRAND_VIDEO_DESPILL_MIX = 0.50
+BRAND_VIDEO_DESPILL_EXPAND = 0.20
+
 
 @dataclass(frozen=True)
 class SponsorConfig:
@@ -50,6 +78,8 @@ def build_cmd(
     hook_text: str | None = None,
     hook_font_path: str | None = None,
     hook_emoji_font_path: str | None = None,
+    brand_logo_path: Path | None = None,
+    brand_video_path: Path | None = None,
 ) -> list[str]:
     duration = max(1.0, trim_end - trim_start)
 
@@ -151,6 +181,52 @@ def build_cmd(
             last = "hooked"
     elif hook_text and hook_font_path:
         log.warning("hook font not found at %r — skipping hook overlay", hook_font_path)
+
+    # Brand logo overlay — centered horizontally and vertically inside the
+    # bottom blurred band. Source PNG is expected to be pre-keyed (transparent
+    # background), so we just scale and composite.
+    if brand_logo_path and Path(brand_logo_path).exists():
+        brand_idx = next_input
+        inputs += ["-i", str(brand_logo_path)]
+        next_input += 1
+        filter_parts.append(
+            f"[{brand_idx}:v]scale={BRAND_LOGO_TARGET_WIDTH}:-1,format=rgba[brand]"
+        )
+        filter_parts.append(
+            f"[{last}][brand]overlay=(W-w)/2:{BRAND_LOGO_BAND_CENTER_Y}-h/2[branded]"
+        )
+        last = "branded"
+    elif brand_logo_path:
+        log.warning("brand logo not found at %r — skipping brand overlay", brand_logo_path)
+
+    # Animated MP4 brand overlay — rendered last so it sits on top of every
+    # other layer. Looped via -stream_loop so its 11s asset covers longer
+    # clips; shortest=1 on the overlay ends output with the main video.
+    if brand_video_path and Path(brand_video_path).exists():
+        bv_idx = next_input
+        inputs += ["-stream_loop", "-1", "-i", str(brand_video_path)]
+        next_input += 1
+        scale = (
+            f"scale={BRAND_VIDEO_WIDTH}:-1," if BRAND_VIDEO_WIDTH > 0 else ""
+        )
+        filter_parts.append(
+            f"[{bv_idx}:v]"
+            f"{scale}"
+            "format=rgba,"
+            f"chromakey={BRAND_VIDEO_CHROMA_COLOR}:"
+            f"{BRAND_VIDEO_CHROMA_SIMILARITY}:{BRAND_VIDEO_CHROMA_BLEND},"
+            f"despill=type=green:mix={BRAND_VIDEO_DESPILL_MIX}:"
+            f"expand={BRAND_VIDEO_DESPILL_EXPAND}"
+            "[bv]"
+        )
+        filter_parts.append(
+            f"[{last}][bv]overlay={BRAND_VIDEO_X}:{BRAND_VIDEO_Y}:shortest=1[bvout]"
+        )
+        last = "bvout"
+    elif brand_video_path:
+        log.warning(
+            "brand video not found at %r — skipping brand video overlay", brand_video_path
+        )
 
     filter_complex = ";".join(filter_parts)
 

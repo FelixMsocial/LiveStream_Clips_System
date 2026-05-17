@@ -312,6 +312,8 @@ def run_pipeline(
             hook_text=hook_text or None,
             hook_font_path=cfg.hook_font_path if hook_text else None,
             hook_emoji_font_path=cfg.hook_emoji_font_path if hook_text else None,
+            brand_logo_path=Path(cfg.brand_logo_path) if cfg.brand_logo_path else None,
+            brand_video_path=Path(cfg.brand_video_path) if cfg.brand_video_path else None,
         )
         t0 = time.monotonic()
         try:

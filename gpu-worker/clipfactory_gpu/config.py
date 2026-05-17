@@ -55,6 +55,18 @@ def _default_font_path() -> str:
     return "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
 
+def _default_brand_logo_path() -> str:
+    """Packaged transparent-PNG logo. Empty string if it isn't shipped."""
+    path = Path(__file__).resolve().parent / "assets" / "brand_logo_mojoonpc.png"
+    return str(path) if path.exists() else ""
+
+
+def _default_brand_video_path() -> str:
+    """Packaged green-screen MP4 brand overlay. Empty string if not shipped."""
+    path = Path(__file__).resolve().parent / "assets" / "brand_video_mojoonpc.mp4"
+    return str(path) if path.exists() else ""
+
+
 def _default_emoji_font_path() -> str:
     """Best-effort color-emoji font for the current platform (empty if none)."""
     if sys.platform == "win32":
@@ -100,6 +112,8 @@ class Config:
     work_dir: str
     hook_font_path: str        # absolute path to a bold sans-serif TTF on the GPU machine
     hook_emoji_font_path: str  # absolute path to a color emoji TTF (empty disables emoji)
+    brand_logo_path: str       # absolute path to a transparent-PNG brand overlay (empty disables)
+    brand_video_path: str      # absolute path to an MP4 brand overlay (green-screen, empty disables)
 
     # Scoring / hook iteration thresholds
     substance_low_threshold: int      # weighted_total below this sets low_potential_flag
@@ -157,6 +171,14 @@ def load_config() -> Config:
         hook_emoji_font_path=os.environ.get(
             "HOOK_EMOJI_FONT_PATH", _default_emoji_font_path()
         ),
+        # Brand logo PNG (transparent, pre-keyed). Defaults to the packaged
+        # MojoOnPC asset; set BRAND_LOGO_PATH="" to disable, or point at a
+        # different transparent PNG to swap branding.
+        brand_logo_path=os.environ.get("BRAND_LOGO_PATH", _default_brand_logo_path()),
+        # Animated MP4 brand overlay (looped, green-screen). Defaults to the
+        # packaged asset; set BRAND_VIDEO_PATH="" to disable, or point at a
+        # different green-screen MP4 to swap.
+        brand_video_path=os.environ.get("BRAND_VIDEO_PATH", _default_brand_video_path()),
         substance_low_threshold=int(os.environ.get("SUBSTANCE_LOW_THRESHOLD", "50")),
         hook_pass_threshold=int(os.environ.get("HOOK_PASS_THRESHOLD", "65")),
         hook_alignment_floor=int(os.environ.get("HOOK_ALIGNMENT_FLOOR", "6")),
