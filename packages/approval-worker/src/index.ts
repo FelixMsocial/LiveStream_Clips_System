@@ -238,7 +238,30 @@ async function sendTelegramWithFallback(
 
 // -------------------- APPROVAL_SEND → Telegram -------------------- //
 
+async function autoApproveClip(clipId: string, env: Env): Promise<void> {
+  const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
+  if (!clip) throw new Error(`clip ${clipId} not found`);
+  if (["approved", "rejected", "dispatched", "posted"].includes(clip.status)) {
+    console.warn(`clip ${clipId} already resolved (${clip.status}), skipping auto-approve`);
+    return;
+  }
+  await clipsDb.setStatus(env.CLIP_DB, clipId, "approved", {
+    approver_decision: "approved",
+    approved_at: new Date().toISOString(),
+  });
+  await clipsDb.appendApprovalLog(env.CLIP_DB, clipId, "approved", "system", {
+    auto_approved: true,
+  });
+  const job: PostDispatchJob = { clip_id: clipId, approved_by: "system" };
+  await env.POST_DISPATCH.send(job);
+}
+
 async function sendApprovalRequest(clipId: string, env: Env): Promise<void> {
+  if (env.SKIP_APPROVAL === "true") {
+    await autoApproveClip(clipId, env);
+    return;
+  }
+
   const clip = await clipsDb.getClip(env.CLIP_DB, clipId);
   if (!clip) throw new Error(`clip ${clipId} not found`);
   if (!clip.final_clip_r2_key) throw new Error(`clip ${clipId} has no final_clip_r2_key`);

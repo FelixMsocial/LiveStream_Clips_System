@@ -32,5 +32,5 @@ crons = ["* * * * *"]
 
 [vars]
 # Lower-case broadcaster login; e.g. "jordy". Override per env via wrangler secret/vars.
-TWITCH_BROADCASTER_LOGIN = "testingmopyeet"
+TWITCH_BROADCASTER_LOGIN = "mojoonpc"
 TWITCH_BOT_NICK = "testingmopyeet"

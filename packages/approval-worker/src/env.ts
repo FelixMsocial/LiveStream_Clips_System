@@ -27,4 +27,6 @@ export interface Env {
 
   READY_TO_POST_RETRY_INTERVAL_MINUTES?: string; // default 30
   READY_TO_POST_MAX_RETRIES?: string;             // default 3
+
+  SKIP_APPROVAL?: string; // "true" to bypass Telegram and auto-approve all clips
 }

@@ -36,3 +36,4 @@ crons = ["* * * * *"]
 DASHBOARD_URL = "https://clipfactory.pages.dev"
 READY_TO_POST_RETRY_INTERVAL_MINUTES = "2"
 READY_TO_POST_MAX_RETRIES = "2"
+SKIP_APPROVAL = "true"
