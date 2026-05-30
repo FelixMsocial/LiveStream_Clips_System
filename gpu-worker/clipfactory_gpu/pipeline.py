@@ -308,7 +308,7 @@ def run_pipeline(
 
         # 6. FFmpeg edit (trim + reframe + word captions + hook overlay + sponsor).
         d1.patch_clip(clip_id, {"status": "editing"})
-        sponsor = _load_sponsor(stream_session_id, work, r2) if stream_session_id else None
+        sponsor = _load_sponsor(work, r2, session_id=stream_session_id)
         cmd = build_cmd(
             ffmpeg_bin=cfg.ffmpeg_bin,
             input_path=raw_path,
@@ -413,23 +413,31 @@ def run_pipeline(
 
 
 def _load_sponsor(
-    session_id: str, work: Path, r2: R2Client
+    work: Path, r2: R2Client, *, session_id: str | None = None
 ) -> SponsorConfig | None:
+    # Candidate keys: global persistent slot first, then legacy session-scoped key.
+    candidates: list[str] = []
     for ext in ("mp4", "mov", "png", "webp"):
-        key = f"sponsors/{session_id}.{ext}"
-        head = r2.head(key)
-        if head:
-            dest = work / f"sponsor.{ext}"
-            r2.download(key, dest)
-            is_video = ext in {"mp4", "mov"}
-            return SponsorConfig(
-                path=dest,
-                is_video=is_video,
-                remove_green=is_video,
-                chroma_similarity=0.28 if is_video else 0.22,
-                chroma_blend=0.00 if is_video else 0.08,
-                opacity=0.95 if is_video else 0.85,
-            )
+        candidates.append(f"sponsors/active.{ext}")
+    if session_id:
+        for ext in ("mp4", "mov", "png", "webp"):
+            candidates.append(f"sponsors/{session_id}.{ext}")
+
+    for key in candidates:
+        if not r2.head(key):
+            continue
+        ext = key.rsplit(".", 1)[-1]
+        dest = work / f"sponsor.{ext}"
+        r2.download(key, dest)
+        is_video = ext in {"mp4", "mov"}
+        return SponsorConfig(
+            path=dest,
+            is_video=is_video,
+            remove_green=is_video,
+            chroma_similarity=0.28 if is_video else 0.22,
+            chroma_blend=0.00 if is_video else 0.08,
+            opacity=0.95 if is_video else 0.85,
+        )
     return None
 
 

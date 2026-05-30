@@ -21,11 +21,19 @@ log = logging.getLogger(__name__)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    s = text.strip()
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("empty response from model")
     if s.startswith("```"):
         s = re.sub(r"^```(?:json)?\s*\n?", "", s)
         s = re.sub(r"\n?```\s*$", "", s)
-    return json.loads(s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", s)
+        if not m:
+            raise
+        return json.loads(m.group(0))
 
 
 def _build_user_message(

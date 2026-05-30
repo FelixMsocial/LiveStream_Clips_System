@@ -22,7 +22,7 @@ import { signJwt, verifyJwt } from "./jwt.js";
 const TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
 const PAGES_PROD_ORIGIN = "https://clipfactory.pages.dev";
 const APPROVAL_WINDOW_SECONDS = 20 * 60;
-const HEARTBEAT_DEAD_MS = 180_000; // 3 missed 60s beats — tolerates one transient failure
+const HEARTBEAT_DEAD_MS = 300_000; // 5 missed 60s beats — tolerates long API/composition runs
 
 export default {
   async queue(batch: MessageBatch<ApprovalSendJob>, env: Env): Promise<void> {
@@ -691,7 +691,7 @@ async function checkHeartbeats(env: Env): Promise<void> {
     }
     const alreadySent = await env.CLIP_KV.get(alertKey);
     if (alreadySent) continue; // Suppress duplicate alerts for 30 minutes.
-    const alertText = `🔴 ${label} has been unresponsive for 3+ minutes.`;
+    const alertText = `🔴 ${label} has been unresponsive for 5+ minutes.`;
     try {
       const result = await sendTelegramWithFallback(
         tg,
