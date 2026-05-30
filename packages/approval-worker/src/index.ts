@@ -1249,14 +1249,10 @@ async function sweepFileCleanup(env: Env): Promise<void> {
   const rows = await env.CLIP_DB.prepare(
     `SELECT id, raw_clip_r2_key, final_clip_r2_key, status
      FROM clips
-     WHERE (
-       (status IN ('rejected', 'expired'))
-       OR
-       (status IN ('posted', 'posted_partial')
-        AND posted_at IS NOT NULL
-        AND posted_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes'))
-     )
-     AND (raw_clip_r2_key IS NOT NULL OR final_clip_r2_key IS NOT NULL)
+     WHERE status IN ('posted', 'posted_partial')
+       AND posted_at IS NOT NULL
+       AND posted_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '-20 minutes')
+       AND (raw_clip_r2_key IS NOT NULL OR final_clip_r2_key IS NOT NULL)
      LIMIT 5`,
   ).all<{ id: string; raw_clip_r2_key: string | null; final_clip_r2_key: string | null; status: string }>();
 

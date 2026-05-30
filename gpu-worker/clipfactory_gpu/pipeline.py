@@ -117,12 +117,12 @@ def _run_hook_loop(
     for iteration in range(1, cfg.hook_max_iterations + 1):
         try:
             last_gen = hook_generate(
-                cfg.anthropic_api_key,
+                cfg.gemini_api_key,
                 prompts["hook_overlay_generator"],
                 substance,
                 iteration=iteration,
                 previous_feedback=feedback,
-                model=cfg.claude_model,
+                model=cfg.gemini_flash_model,
             )
         except Exception as e:  # noqa: BLE001
             log.warning("hook generator failed on iter %d: %s", iteration, e)
@@ -136,13 +136,13 @@ def _run_hook_loop(
 
         try:
             last_score = hook_score(
-                cfg.anthropic_api_key,
+                cfg.gemini_api_key,
                 prompts["hook_overlay_scorer"],
                 last_gen,
                 substance,
                 iteration=iteration,
                 previous_feedback=feedback,
-                model=cfg.claude_model,
+                model=cfg.gemini_flash_model,
                 pass_threshold=cfg.hook_pass_threshold,
                 alignment_floor=cfg.hook_alignment_floor,
             )
@@ -349,14 +349,14 @@ def run_pipeline(
         timings["upload"] = _ms_since(t0)
         d1.patch_clip(clip_id, {"final_clip_r2_key": final_key})
 
-        # 8. Step 4 — Per-platform captions (single Claude call).
+        # 8. Step 4 — Per-platform captions (single Gemini Flash call).
         t0 = time.monotonic()
         captions, caption_full, copy_err = run_copy(
-            cfg.anthropic_api_key,
+            cfg.gemini_api_key,
             prompts["per_platform_post_text"],
             substance,
             hook_out,
-            model=cfg.claude_model,
+            model=cfg.gemini_flash_model,
         )
         timings["copy"] = _ms_since(t0)
         if copy_err:

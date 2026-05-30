@@ -1,11 +1,8 @@
-"""Step 2 — Hook Overlay Generator (Claude Sonnet 4.5).
+"""Step 2 — Hook Overlay Generator (Gemini Flash).
 
 Produces the on-video hook text from the Substance Scorer's structured output.
 On iterations 2-3 receives `previous_feedback` from the Hook Scorer so it can
 address specific rule failures rather than regenerate blindly.
-
-The system prompt is sent with `cache_control` so iterations 2-3 reuse the
-cached prefix (the prompt body is unchanged across iterations within one clip).
 """
 from __future__ import annotations
 
@@ -14,7 +11,8 @@ import logging
 import re
 from typing import Any
 
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 log = logging.getLogger(__name__)
@@ -66,29 +64,24 @@ def generate(
     *,
     iteration: int = 1,
     previous_feedback: list[dict[str, Any]] | None = None,
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "gemini-2.5-flash",
 ) -> dict[str, Any]:
-    client = Anthropic(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     user_msg = _build_user_message(
         substance,
         iteration=iteration,
         previous_feedback=previous_feedback,
     )
-    resp = client.messages.create(
+    resp = client.models.generate_content(
         model=model,
-        max_tokens=1200,
-        temperature=0.7,
-        system=[
-            {
-                "type": "text",
-                "text": prompt_body,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_msg}],
+        config=types.GenerateContentConfig(
+            system_instruction=prompt_body,
+            temperature=0.7,
+            response_mime_type="application/json",
+        ),
+        contents=user_msg,
     )
-    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-    data = _extract_json(text)
+    data = _extract_json(resp.text or "")
 
     if "hook_text" not in data or not data["hook_text"]:
         raise ValueError("hook generator returned no hook_text")

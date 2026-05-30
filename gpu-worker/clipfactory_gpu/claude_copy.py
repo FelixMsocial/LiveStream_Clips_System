@@ -1,9 +1,8 @@
-"""Step 4 — Per-Platform Post Text Generator (Claude Sonnet 4.5).
+"""Step 4 — Per-Platform Post Text Generator (Gemini Flash).
 
-ONE Claude call returns three structurally-different captions (YouTube Shorts,
-TikTok, Instagram Reels) in a single JSON response per the v1.1 prompt. Replaces
-the old 3-call sequential pattern (which spaced calls 10s apart for "HR
-learning") — net savings ~30s per clip.
+ONE call returns three structurally-different captions (YouTube Shorts,
+TikTok, Instagram Reels) in a single JSON response. Gemini's native JSON
+mode (response_mime_type) guarantees a parseable response every time.
 """
 from __future__ import annotations
 
@@ -12,10 +11,27 @@ import logging
 import re
 from typing import Any
 
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 log = logging.getLogger(__name__)
+
+
+_STRIP_CHARS = (
+    '"\u201c\u201d\u201e\u201f\u2033\u2036'  # double-quote variants
+    "'\u2018\u2019\u201a\u201b\u2032\u2035"  # single-quote variants
+)
+_DASH_MAP = str.maketrans("\u2013\u2014\u2015", "---")
+
+
+def _sanitize(text: str) -> str:
+    """Strip all double and single quote variants, normalize dashes.
+
+    Metricool rejects captions containing quote chars -- they break its text field.
+    """
+    result = text.translate(str.maketrans("", "", _STRIP_CHARS))
+    return result.translate(_DASH_MAP).strip()
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -53,25 +69,22 @@ def _build_user_message(
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=30))
 def _call(
-    client: Anthropic,
+    api_key: str,
     prompt_body: str,
     user_msg: str,
     model: str,
 ) -> str:
-    resp = client.messages.create(
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
         model=model,
-        max_tokens=1500,
-        temperature=0.7,
-        system=[
-            {
-                "type": "text",
-                "text": prompt_body,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[{"role": "user", "content": user_msg}],
+        config=types.GenerateContentConfig(
+            system_instruction=prompt_body,
+            temperature=0.7,
+            response_mime_type="application/json",
+        ),
+        contents=user_msg,
     )
-    return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+    return (resp.text or "").strip()
 
 
 def run_copy(
@@ -80,7 +93,7 @@ def run_copy(
     substance: dict[str, Any],
     hook_output: dict[str, Any],
     *,
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "gemini-2.5-flash",
     fallback_url: str | None = None,
 ) -> tuple[dict[str, str], dict[str, Any], str | None]:
     """Generate IG/YT/TT captions in one call.
@@ -90,11 +103,10 @@ def run_copy(
       caption_scores: full JSON from the model (for `caption_scores_json` column)
       error: str | None if the call failed and fallbacks were used
     """
-    client = Anthropic(api_key=api_key)
     user_msg = _build_user_message(substance, hook_output)
 
     try:
-        raw = _call(client, prompt_body, user_msg, model)
+        raw = _call(api_key, prompt_body, user_msg, model)
         data = _extract_json(raw)
     except Exception as e:  # noqa: BLE001
         log.warning("per-platform caption call failed: %s", e)
@@ -113,9 +125,9 @@ def run_copy(
     fallback = fallback_url or "🔴 Live now"
     return (
         {
-            "instagram": ig.strip() or fallback,
-            "youtube": yt.strip() or fallback,
-            "tiktok": tt.strip() or fallback,
+            "instagram": _sanitize(ig.strip()) or fallback,
+            "youtube": _sanitize(yt.strip()) or fallback,
+            "tiktok": _sanitize(tt.strip()) or fallback,
         },
         data,
         None,

@@ -122,8 +122,8 @@ class Config:
     hook_max_iterations: int          # max generate→score loops before shipping best-effort
 
     # Models
-    claude_model: str
     gemini_model: str
+    gemini_flash_model: str
 
 
 def load_config() -> Config:
@@ -183,8 +183,8 @@ def load_config() -> Config:
         hook_pass_threshold=int(os.environ.get("HOOK_PASS_THRESHOLD", "65")),
         hook_alignment_floor=int(os.environ.get("HOOK_ALIGNMENT_FLOOR", "6")),
         hook_max_iterations=int(os.environ.get("HOOK_MAX_ITERATIONS", "3")),
-        claude_model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-pro"),
+        gemini_flash_model=os.environ.get("GEMINI_FLASH_MODEL", "gemini-2.5-flash"),
     )
 
 

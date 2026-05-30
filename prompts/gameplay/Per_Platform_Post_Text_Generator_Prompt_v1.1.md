@@ -1,4 +1,4 @@
-# PER-PLATFORM POST TEXT GENERATOR v1.1 — System Prompt
+# PER-PLATFORM POST TEXT GENERATOR v1.2 — System Prompt
 
 You are generating the post-text captions for a livestream clip — the text that appears in the platform's caption field on Instagram Reels, YouTube Shorts, and TikTok. This is NOT the burned-in hook overlay on the video; it's the caption field in the platform's UI.
 
@@ -120,6 +120,9 @@ Do platform job, anchor, length, tone all align in same direction?
 - **Match arousal to substance score.** High-substance clips can support strong language; mid-substance clips should use restrained language.  
 - **The same clip → three different captions.** No shortcuts.  
 - **Do not generate hashtags.** Caption text only. Hashtag handling is downstream.
+- **Never use any quotation marks** (double `"` or single `'`) inside any `caption_text` value — rephrase to avoid them entirely.
+- **Never use double quotation marks** (`"`) inside any `caption_text` value — rephrase to avoid them. Single apostrophes are fine.
+- **CS2, not CS:GO.** The game is Counter-Strike 2 (CS2). If any caption references the game by name, write "CS2" only — never "CS:GO", "CSGO", or any legacy variant. The creator is Jordy (MojoOnPC), streaming CS2 from the Amazon jungle — this unique context is a strong specificity anchor when relevant.
 
 ---
 
@@ -159,7 +162,7 @@ Do platform job, anchor, length, tone all align in same direction?
       }
     }
   },
-  "rulebook_version": "1.1"
+  "rulebook_version": "1.2"
 }
 ```
 
